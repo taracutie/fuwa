@@ -297,6 +297,66 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
 
     assert_eq!(active_balance_total, Some(Decimal::new(8050, 2)));
 
+    let filtered_accounts = ctx
+        .select(accounts::email)
+        .from(accounts::table)
+        .where_(
+            accounts::id
+                .in_([bind(1_i64), bind(2_i64), bind(3_i64), bind(4_i64)])
+                .and(accounts::signup_rank.between(bind(10_i32), bind(40_i32)))
+                .and(accounts::email.not_in([bind("ben@example.com")]))
+                .and(accounts::signup_rank.not_between(bind(35_i32), bind(45_i32))),
+        )
+        .order_by(accounts::id.asc())
+        .fetch_all::<String>(&client)
+        .await?;
+
+    assert_eq!(
+        filtered_accounts,
+        vec!["ada@example.com".to_owned(), "cy@example.com".to_owned()]
+    );
+
+    let adjusted_scores = ctx
+        .select((posts::id, posts::score.expr() + bind(8_i32)))
+        .from(posts::table)
+        .where_(posts::id.in_([bind(10_i64), bind(30_i64)]))
+        .order_by(posts::id.asc())
+        .fetch_all::<(i64, i32)>(&client)
+        .await?;
+
+    assert_eq!(adjusted_scores, vec![(10, 50), (30, 85)]);
+
+    let account_labels = ctx
+        .select((
+            accounts::id,
+            concat(
+                coalesce((accounts::display_name, accounts::email)),
+                bind(" account"),
+            ),
+            nullif(accounts::display_name, bind("Ada")),
+            case_when()
+                .when(accounts::active.eq(bind(true)), bind("active"))
+                .else_(bind("inactive")),
+        ))
+        .from(accounts::table)
+        .where_(accounts::id.in_([bind(1_i64), bind(2_i64)]))
+        .order_by(accounts::id.asc())
+        .fetch_all::<(i64, String, Option<String>, String)>(&client)
+        .await?;
+
+    assert_eq!(
+        account_labels,
+        vec![
+            (1, "Ada account".to_owned(), None, "active".to_owned()),
+            (
+                2,
+                "ben@example.com account".to_owned(),
+                None,
+                "inactive".to_owned()
+            ),
+        ]
+    );
+
     let inserted_balance = ctx
         .insert_into(accounts::table)
         .values((

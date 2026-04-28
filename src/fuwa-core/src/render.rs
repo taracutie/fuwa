@@ -1,9 +1,9 @@
 use postgres_types::ToSql;
 
 use crate::{
-    quote_ident, Assignment, BinaryOp, BindValue, DeleteQuery, Error, ExprNode, FieldRef,
-    InsertQuery, Join, JoinKind, OrderDirection, OrderExpr, Result, SelectItem, SelectQuery, Table,
-    UnaryOp, UpdateQuery,
+    quote_ident, ArithmeticOp, Assignment, BinaryOp, BindValue, DeleteQuery, Error, ExprNode,
+    FieldRef, InsertQuery, Join, JoinKind, OrderDirection, OrderExpr, Result, SelectItem,
+    SelectQuery, Table, UnaryOp, UpdateQuery,
 };
 
 /// A rendered SQL statement plus owned bind values.
@@ -374,6 +374,70 @@ fn render_expr(
             renderer.sql.push(')');
             Ok(())
         }
+        ExprNode::In {
+            expr,
+            list,
+            negated,
+        } => {
+            if list.is_empty() {
+                return Err(Error::invalid_query_shape(
+                    "IN predicate requires at least one list item",
+                ));
+            }
+
+            renderer.sql.push('(');
+            render_expr(*expr, renderer, qualification)?;
+            if negated {
+                renderer.sql.push_str(" not in (");
+            } else {
+                renderer.sql.push_str(" in (");
+            }
+            for (index, item) in list.into_iter().enumerate() {
+                if index > 0 {
+                    renderer.sql.push_str(", ");
+                }
+                render_expr(item, renderer, qualification)?;
+            }
+            renderer.sql.push_str("))");
+            Ok(())
+        }
+        ExprNode::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            renderer.sql.push('(');
+            render_expr(*expr, renderer, qualification)?;
+            if negated {
+                renderer.sql.push_str(" not between ");
+            } else {
+                renderer.sql.push_str(" between ");
+            }
+            render_expr(*low, renderer, qualification)?;
+            renderer.sql.push_str(" and ");
+            render_expr(*high, renderer, qualification)?;
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::Arithmetic { op, left, right } => {
+            renderer.sql.push('(');
+            render_expr(*left, renderer, qualification)?;
+            renderer.sql.push(' ');
+            renderer.sql.push_str(arithmetic_op_sql(op));
+            renderer.sql.push(' ');
+            render_expr(*right, renderer, qualification)?;
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::StringConcat { left, right } => {
+            renderer.sql.push('(');
+            render_expr(*left, renderer, qualification)?;
+            renderer.sql.push_str(" || ");
+            render_expr(*right, renderer, qualification)?;
+            renderer.sql.push(')');
+            Ok(())
+        }
         ExprNode::Function { name, args } => {
             renderer.sql.push_str(name);
             renderer.sql.push('(');
@@ -384,6 +448,30 @@ fn render_expr(
                 render_expr(arg, renderer, qualification)?;
             }
             renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::Case {
+            branches,
+            else_expr,
+        } => {
+            if branches.is_empty() {
+                return Err(Error::invalid_query_shape(
+                    "CASE expression requires at least one WHEN branch",
+                ));
+            }
+
+            renderer.sql.push_str("(case");
+            for (condition, value) in branches {
+                renderer.sql.push_str(" when ");
+                render_expr(condition, renderer, qualification)?;
+                renderer.sql.push_str(" then ");
+                render_expr(value, renderer, qualification)?;
+            }
+            if let Some(else_expr) = else_expr {
+                renderer.sql.push_str(" else ");
+                render_expr(*else_expr, renderer, qualification)?;
+            }
+            renderer.sql.push_str(" end)");
             Ok(())
         }
         ExprNode::Star => {
@@ -408,6 +496,15 @@ fn binary_op_sql(op: BinaryOp) -> &'static str {
     }
 }
 
+fn arithmetic_op_sql(op: ArithmeticOp) -> &'static str {
+    match op {
+        ArithmeticOp::Add => "+",
+        ArithmeticOp::Sub => "-",
+        ArithmeticOp::Mul => "*",
+        ArithmeticOp::Div => "/",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
@@ -419,6 +516,7 @@ mod tests {
         pub const table: Table = Table::new("public", "users");
         pub const id: Field<i64, NotNull> = Field::new(table, "id");
         pub const email: Field<String, NotNull> = Field::new(table, "email");
+        pub const display_name: Field<String, Nullable> = Field::new(table, "display_name");
         pub const active: Field<bool, NotNull> = Field::new(table, "active");
         pub const signup_rank: Field<i32, NotNull> = Field::new(table, "signup_rank");
         pub const created_at: Field<i64, NotNull> = Field::new(table, "created_at");
@@ -613,6 +711,188 @@ mod tests {
             )
         );
         assert_eq!(query.binds().len(), 3);
+    }
+
+    #[test]
+    fn renders_in_and_not_in_predicates() {
+        let query =
+            Context::new()
+                .select(users::id)
+                .from(users::table)
+                .where_(users::id.in_([bind(1_i64), bind(2_i64)]).and(
+                    users::email.not_in([bind("blocked@example.com"), bind("spam@example.com")]),
+                ))
+                .render()
+                .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id" from "public"."users" "#,
+                r#"where (("users"."id" in ($1, $2)) and "#,
+                r#"("users"."email" not in ($3, $4)))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 4);
+    }
+
+    #[test]
+    fn renders_between_and_not_between_predicates() {
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(
+                users::created_at
+                    .between(bind(10_i64), bind(20_i64))
+                    .and(users::signup_rank.not_between(bind(1_i32), bind(5_i32))),
+            )
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id" from "public"."users" "#,
+                r#"where (("users"."created_at" between $1 and $2) and "#,
+                r#"("users"."signup_rank" not between $3 and $4))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 4);
+    }
+
+    #[test]
+    fn renders_arithmetic_expressions() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<i32, NotNull>(users::signup_rank.expr() + bind(1_i32));
+        assert_expr_type::<i32, Nullable>(nullable(users::signup_rank) + bind(1_i32));
+
+        let query = Context::new()
+            .select((
+                users::signup_rank.expr() + bind(1_i32),
+                users::signup_rank.expr() - bind(2_i32),
+                users::signup_rank.expr() * bind(3_i32),
+                users::signup_rank.expr() / bind(4_i32),
+            ))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select ("users"."signup_rank" + $1), "#,
+                r#"("users"."signup_rank" - $2), "#,
+                r#"("users"."signup_rank" * $3), "#,
+                r#"("users"."signup_rank" / $4) from "public"."users""#
+            )
+        );
+        assert_eq!(query.binds().len(), 4);
+    }
+
+    #[test]
+    fn renders_concat_coalesce_and_nullif() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<String, NotNull>(concat(users::email, bind("!")));
+        assert_expr_type::<String, Nullable>(concat(users::display_name, users::email));
+        assert_expr_type::<String, NotNull>(coalesce((users::display_name, users::email)));
+        assert_expr_type::<String, Nullable>(nullif(users::email, bind("")));
+
+        let query = Context::new()
+            .select((
+                concat(users::email, bind("!")),
+                coalesce((users::display_name, users::email)),
+                nullif(users::email, bind("")),
+            ))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select ("users"."email" || $1), "#,
+                r#"coalesce("users"."display_name", "users"."email"), "#,
+                r#"nullif("users"."email", $2) from "public"."users""#
+            )
+        );
+        assert_eq!(query.binds().len(), 2);
+    }
+
+    #[test]
+    fn renders_case_when_with_else() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<String, NotNull>(
+            case_when()
+                .when(users::active.eq(bind(true)), bind("active"))
+                .else_(bind("inactive")),
+        );
+
+        let query = Context::new()
+            .select(
+                case_when()
+                    .when(users::active.eq(bind(true)), bind("active"))
+                    .when(users::signup_rank.gt(bind(10_i32)), bind("ranked"))
+                    .else_(bind("inactive")),
+            )
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select (case when ("users"."active" = $1) then $2 "#,
+                r#"when ("users"."signup_rank" > $3) then $4 else $5 end) "#,
+                r#"from "public"."users""#
+            )
+        );
+        assert_eq!(query.binds().len(), 5);
+    }
+
+    #[test]
+    fn renders_case_when_without_else_as_nullable() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<String, Nullable>(
+            case_when()
+                .when(users::active.eq(bind(true)), bind("active"))
+                .end(),
+        );
+
+        let query = Context::new()
+            .select(
+                case_when()
+                    .when(users::active.eq(bind(true)), bind("active"))
+                    .end(),
+            )
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select (case when ("users"."active" = $1) then $2 end) "#,
+                r#"from "public"."users""#
+            )
+        );
+        assert_eq!(query.binds().len(), 2);
+    }
+
+    #[test]
+    fn empty_in_list_is_invalid_query_shape() {
+        let result = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::id.in_(Vec::<Expr<i64, NotNull>>::new()))
+            .render();
+
+        assert!(
+            matches!(result, Err(Error::InvalidQueryShape(message)) if message.contains("IN predicate"))
+        );
     }
 
     #[test]
