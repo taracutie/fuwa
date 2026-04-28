@@ -10,66 +10,50 @@
 
 ---
 
-'s just my cute crate to interact with postgres in a safe + performant (hopefully) manner
+`fuwa`'s just my cute crate to interact with postgres in a safe + performant
+(hopefully) manner.
 
 ## quickstart
 
-```rust
-use fuwa::prelude::*;
+### 1. add dependencies
 
-#[allow(non_upper_case_globals)]
-mod users {
-    use fuwa::prelude::*;
 
-    pub const table: Table = Table::new("public", "users");
-    pub const id: Field<i64, NotNull> = Field::new(table, "id");
-    pub const email: Field<String, NotNull> = Field::new(table, "email");
-    pub const active: Field<bool, NotNull> = Field::new(table, "active");
-}
-
-async fn example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
-    let ctx = Context::new();
-
-    let _rows = ctx
-        .select((users::id, users::email))
-        .from(users::table)
-        .where_(users::active.eq(bind(true)))
-        .order_by(users::id.desc())
-        .limit(20)
-        .fetch_all::<(i64, String)>(client)
-        .await?;
-
-    Ok(())
-}
+```toml
+# Cargo.toml
+[dependencies]
+fuwa = { git = "ssh://git@github.com/taracutie/fuwa.git" }
 ```
 
-for stuff the typed DSL doesn't cover yet, there's raw SQL + separate bind values:
+### 2. create tables
 
-```rust
-use fuwa::prelude::*;
+`fuwa-codegen` reads your existing postgres tables. for example:
 
-async fn raw_example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
-    let _rows = raw(r#"select filename from "ImageMetadata" where filename = any($1)"#)
-        .bind(vec!["a.jpg".to_owned(), "b.jpg".to_owned()])
-        .fetch_all::<String>(client)
-        .await?;
+```sql
+create table public.users (
+    id bigserial primary key,
+    email text not null,
+    active boolean not null default true,
+    created_at timestamptz not null default now()
+);
 
-    Ok(())
-}
+create table public.posts (
+    id bigserial primary key,
+    user_id bigint not null references public.users(id),
+    title text not null,
+    published boolean not null default false
+);
 ```
 
-## codegen
+### 3. install and run codegen
 
-generate a schema module from postgres:
+install the cli from the repo:
 
 ```sh
-fuwa-codegen \
-  --database-url "$DATABASE_URL" \
-  --schema public \
-  --out src/schema.rs
+CARGO_NET_GIT_FETCH_WITH_CLI=true \
+  cargo install --git ssh://git@github.com/taracutie/fuwa.git fuwa-codegen --locked
 ```
 
-or limit it to specific schemas / tables:
+generate a rust schema module:
 
 ```sh
 fuwa-codegen \
@@ -80,10 +64,175 @@ fuwa-codegen \
   --out src/schema.rs
 ```
 
-`--schema` and `--table` can repeat or be comma-separated. tables can be
-unqualified (`users`) or schema-qualified (`admin.audit_log`).
+`--schema` and `--table` can be repeated or comma-separated. tables can be
+unqualified (`users`) or schema-qualified (`admin.audit_log`). if you skip
+`--table`, it just generates all supported tables in the selected schemas.
 
-you get `Table` and `Field<T, Nullability>` values, plus a `Record` type and `all()` selection helper.
+generated modules come with `Table` constants, typed `Field<T, Nullability>`
+constants, a `Record` struct, a `FromRow` impl, + an `all()` selection helper:
+
+```rust
+pub mod users {
+    use fuwa::prelude::*;
+
+    pub const table: Table = Table::new("public", "users");
+    pub const id: Field<i64, NotNull> = Field::new(table, "id");
+    pub const email: Field<String, NotNull> = Field::new(table, "email");
+    pub const active: Field<bool, NotNull> = Field::new(table, "active");
+
+    #[derive(Debug, Clone)]
+    pub struct Record {
+        pub id: i64,
+        pub email: String,
+        pub active: bool,
+        // plus the rest of the table columns
+    }
+
+    pub fn all() -> All {
+        All
+    }
+}
+```
+
+### 4. import the generated schema
+
+drop the generated module into your app:
+
+```rust
+mod schema;
+
+use fuwa::prelude::*;
+use schema::{posts, users};
+```
+
+### 5. build and execute queries
+
+`Context` is the query builder entry point. values go thru `bind(...)` ~
+they're never just stuffed into the SQL text.
+
+```rust
+let ctx = Context::new();
+
+let rows = ctx
+    .select((users::id, users::email, posts::title))
+    .from(users::table)
+    .join(posts::table.on(posts::user_id.eq(users::id)))
+    .where_(users::active.eq(bind(true)))
+    .order_by(users::created_at.desc())
+    .limit(20)
+    .fetch_all::<(i64, String, String)>(&client)
+    .await?;
+
+let users = ctx
+    .select(users::all())
+    .from(users::table)
+    .where_(users::email.ilike(bind("%@example.com")))
+    .fetch_all::<users::Record>(&client)
+    .await?;
+```
+
+### full example
+
+this assumes `src/schema.rs` was generated from the `users` + `posts` tables
+up above.
+
+```rust
+mod schema;
+
+use fuwa::prelude::*;
+use schema::{posts, users};
+use tokio_postgres::NoTls;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")?;
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("postgres connection error: {err}");
+        }
+    });
+
+    let ctx = Context::new();
+
+    let user_id = ctx
+        .insert_into(users::table)
+        .values((
+            users::email.set(bind("tara@example.com")),
+            users::active.set(bind(true)),
+        ))
+        .returning(users::id)
+        .fetch_one::<i64>(&client)
+        .await?;
+
+    let post_id = ctx
+        .insert_into(posts::table)
+        .values((
+            posts::user_id.set(bind(user_id)),
+            posts::title.set(bind("hello from fuwa")),
+            posts::published.set(bind(true)),
+        ))
+        .returning(posts::id)
+        .fetch_one::<i64>(&client)
+        .await?;
+
+    let joined = ctx
+        .select((users::id, users::email, posts::title))
+        .from(users::table)
+        .join(posts::table.on(posts::user_id.eq(users::id)))
+        .where_(users::active.eq(bind(true)).and(posts::published.eq(bind(true))))
+        .order_by((users::id.asc(), posts::id.desc()))
+        .limit(20)
+        .fetch_all::<(i64, String, String)>(&client)
+        .await?;
+
+    let matching_users = ctx
+        .select(users::all())
+        .from(users::table)
+        .where_(users::email.ilike(bind("%@example.com")))
+        .fetch_all::<users::Record>(&client)
+        .await?;
+
+    let renamed_email = ctx
+        .update(users::table)
+        .set(users::email.set(bind("new@example.com")))
+        .where_(users::id.eq(bind(user_id)))
+        .returning(users::email)
+        .fetch_one::<String>(&client)
+        .await?;
+
+    let deleted_posts = ctx
+        .delete_from(posts::table)
+        .where_(posts::id.eq(bind(post_id)))
+        .execute(&client)
+        .await?;
+
+    println!("{joined:?}");
+    println!("{matching_users:?}");
+    println!("renamed to {renamed_email}, deleted {deleted_posts} post(s)");
+
+    Ok(())
+}
+```
+
+## raw SQL escape hatch
+
+for SQL the typed DSL doesnt cover yet, you can drop into raw SQL with separate bind values:
+
+```rust
+use fuwa::prelude::*;
+
+async fn raw_example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
+    let rows = raw(r#"select filename from "ImageMetadata" where filename = any($1)"#)
+        .bind(vec!["a.jpg".to_owned(), "b.jpg".to_owned()])
+        .fetch_all::<String>(client)
+        .await?;
+
+    println!("{rows:?}");
+    Ok(())
+}
+```
 
 ## local postgres tests
 
@@ -92,11 +241,8 @@ docker compose up -d postgres
 FUWA_TEST_DATABASE_URL=postgres://fuwa:fuwa@localhost:15432/fuwa cargo test -p fuwa-postgres --test postgres
 ```
 
-## safety
+## notes
 
-- values are always rendered as postgres bind placeholders (`$1`, `$2`, ...).
-- bind values are stored separately and passed straight to `tokio-postgres`.
-- raw SQL escape hatches still collect values through `.bind(...)` ~ don't interpolate values into raw SQL text.
-- identifiers are quoted with double quotes and embedded quotes are escaped.
-- generated schema code should be your primary source of table + field identifiers.
-- `fuwa-codegen` connects with `default_transaction_read_only=on` and introspects inside an explicit `BEGIN READ ONLY` transaction.
+- `fuwa-codegen` connects with `default_transaction_read_only=on` and pokes
+  around inside an explicit `BEGIN READ ONLY` transaction (so it cant mess up
+  your db on accident).
