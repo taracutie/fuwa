@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use crate::{
-    Condition, ExprNode, Field, FieldRef, OrderDirection, OrderExpr, RenderQuery, RenderedQuery,
-    Result, SelectItem, Selectable, Table,
+    Condition, Expr, ExprNode, Field, FieldRef, OrderDirection, OrderExpr, RenderQuery,
+    RenderedQuery, Result, SelectItem, Selectable, Table,
 };
 
 /// Stateless entry point for building queries.
@@ -20,9 +20,12 @@ impl Context {
     {
         SelectQuery {
             selection: selection.into_select_items(),
+            distinct: None,
             from: None,
             joins: Vec::new(),
             where_clause: None,
+            group_by: Vec::new(),
+            having: None,
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -63,16 +66,39 @@ impl Context {
 #[derive(Debug)]
 pub struct SelectQuery<R = ()> {
     pub(crate) selection: Vec<SelectItem>,
+    pub(crate) distinct: Option<SelectDistinct>,
     pub(crate) from: Option<Table>,
     pub(crate) joins: Vec<Join>,
     pub(crate) where_clause: Option<Condition>,
+    pub(crate) group_by: Vec<ExprNode>,
+    pub(crate) having: Option<Condition>,
     pub(crate) order_by: Vec<OrderExpr>,
     pub(crate) limit: Option<i64>,
     pub(crate) offset: Option<i64>,
     marker: PhantomData<fn() -> R>,
 }
 
+/// `SELECT` distinct mode.
+#[derive(Debug)]
+pub(crate) enum SelectDistinct {
+    Distinct,
+    DistinctOn(Vec<ExprNode>),
+}
+
 impl<R> SelectQuery<R> {
+    pub fn distinct(mut self) -> Self {
+        self.distinct = Some(SelectDistinct::Distinct);
+        self
+    }
+
+    pub fn distinct_on<E>(mut self, columns: E) -> Self
+    where
+        E: ExprList,
+    {
+        self.distinct = Some(SelectDistinct::DistinctOn(columns.into_exprs()));
+        self
+    }
+
     pub fn from(mut self, table: Table) -> Self {
         self.from = Some(table);
         self
@@ -104,6 +130,22 @@ impl<R> SelectQuery<R> {
         self
     }
 
+    pub fn group_by<E>(mut self, group_by: E) -> Self
+    where
+        E: ExprList,
+    {
+        self.group_by.extend(group_by.into_exprs());
+        self
+    }
+
+    pub fn having(mut self, condition: Condition) -> Self {
+        self.having = Some(match self.having {
+            Some(existing) => existing.and(condition),
+            None => condition,
+        });
+        self
+    }
+
     pub fn order_by<O>(mut self, order_by: O) -> Self
     where
         O: OrderByList,
@@ -126,6 +168,50 @@ impl<R> SelectQuery<R> {
         RenderQuery::render(self)
     }
 }
+
+/// A list of SQL expressions.
+pub trait ExprList {
+    fn into_exprs(self) -> Vec<ExprNode>;
+}
+
+impl<T, N> ExprList for Field<T, N> {
+    fn into_exprs(self) -> Vec<ExprNode> {
+        vec![self.expr().into_node()]
+    }
+}
+
+impl<T, N> ExprList for Expr<T, N> {
+    fn into_exprs(self) -> Vec<ExprNode> {
+        vec![self.into_node()]
+    }
+}
+
+macro_rules! impl_tuple_expr_list {
+    ($($ty:ident $var:ident),+ $(,)?) => {
+        impl<$($ty),+> ExprList for ($($ty,)+)
+        where
+            $($ty: ExprList),+
+        {
+            fn into_exprs(self) -> Vec<ExprNode> {
+                let ($($var,)+) = self;
+                let mut exprs = Vec::new();
+                $(
+                    exprs.extend($var.into_exprs());
+                )+
+                exprs
+            }
+        }
+    };
+}
+
+impl_tuple_expr_list!(A a);
+impl_tuple_expr_list!(A a, B b);
+impl_tuple_expr_list!(A a, B b, C c);
+impl_tuple_expr_list!(A a, B b, C c, D d);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h);
 
 /// SQL join kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

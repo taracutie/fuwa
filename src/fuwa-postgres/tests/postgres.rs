@@ -392,6 +392,17 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
 
     assert_eq!(published_post_count, 3);
 
+    let post_counts_by_account = ctx
+        .select((posts::account_id, count_star()))
+        .from(posts::table)
+        .group_by(posts::account_id)
+        .having(count_star().gt(bind(1_i64)))
+        .order_by(posts::account_id.asc())
+        .fetch_all::<(i64, i64)>(&client)
+        .await?;
+
+    assert_eq!(post_counts_by_account, vec![(1, 2)]);
+
     let inserted_comment = ctx
         .insert_into(comments::table)
         .values((

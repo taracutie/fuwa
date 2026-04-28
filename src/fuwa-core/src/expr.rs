@@ -2,8 +2,9 @@ use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Not, Sub};
 
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
-use crate::{BindParam, Field, NotNull, Nullable, Table};
+use crate::{BindParam, Field, NotNull, NullabilityOutput, Nullable, Table};
 
 /// Reference to a field in the AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,6 +70,39 @@ macro_rules! impl_sql_numeric {
 }
 
 impl_sql_numeric!(i16, i32, i64, f32, f64, Decimal);
+
+/// Marker trait for SQL scalar types accepted by `array_agg`.
+///
+/// This intentionally excludes generated PostgreSQL array columns such as
+/// `Field<Vec<String>>`: PostgreSQL's `array_agg(anyarray)` overload returns a
+/// multidimensional array that `postgres-types` does not decode into nested
+/// `Vec` values.
+pub trait ArrayAggInput {}
+
+macro_rules! impl_array_agg_input {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl ArrayAggInput for $ty {}
+        )+
+    };
+}
+
+impl_array_agg_input!(
+    i16,
+    i32,
+    i64,
+    f32,
+    f64,
+    bool,
+    String,
+    Uuid,
+    chrono::NaiveDate,
+    chrono::NaiveDateTime,
+    chrono::DateTime<chrono::Utc>,
+    Decimal,
+    serde_json::Value,
+    Vec<u8>,
+);
 
 /// Type-level SQL nullability for expressions that are nullable if either side is nullable.
 #[doc(hidden)]
@@ -869,6 +903,35 @@ impl SumOutput for f64 {
     type Output = f64;
 }
 
+/// PostgreSQL return type for `avg(expression)`.
+pub trait AvgOutput {
+    type Output;
+}
+
+impl AvgOutput for i16 {
+    type Output = Decimal;
+}
+
+impl AvgOutput for i32 {
+    type Output = Decimal;
+}
+
+impl AvgOutput for i64 {
+    type Output = Decimal;
+}
+
+impl AvgOutput for Decimal {
+    type Output = Decimal;
+}
+
+impl AvgOutput for f32 {
+    type Output = f64;
+}
+
+impl AvgOutput for f64 {
+    type Output = f64;
+}
+
 /// Render `sum(expression)`.
 pub fn sum<T, E>(expr: E) -> Expr<T::Output, Nullable>
 where
@@ -877,6 +940,104 @@ where
 {
     Expr::from_node(ExprNode::Function {
         name: "sum",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `min(expression)`.
+pub fn min<T, E>(expr: E) -> Expr<T, Nullable>
+where
+    E: IntoExpr<T>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "min",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `max(expression)`.
+pub fn max<T, E>(expr: E) -> Expr<T, Nullable>
+where
+    E: IntoExpr<T>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "max",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `avg(expression)`.
+pub fn avg<T, E>(expr: E) -> Expr<T::Output, Nullable>
+where
+    E: IntoExpr<T>,
+    T: AvgOutput,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "avg",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `array_agg(expression)`.
+///
+/// PostgreSQL array inputs are rejected at the Rust type level because
+/// `array_agg(anyarray)` returns a multidimensional array, which is not
+/// supported by this crate's `Vec<T>` decoding path.
+///
+/// ```compile_fail
+/// use fuwa_core::{array_agg, Field, NotNull, Table};
+///
+/// let table = Table::new("public", "users");
+/// let tags: Field<Vec<String>, NotNull> = table.field("tags");
+/// let _ = array_agg(tags);
+/// ```
+pub fn array_agg<T, E>(
+    expr: E,
+) -> Expr<Vec<<E::Nullability as NullabilityOutput<T>>::Output>, Nullable>
+where
+    E: IntoExpr<T>,
+    T: ArrayAggInput,
+    E::Nullability: NullabilityOutput<T>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "array_agg",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `string_agg(expression, delimiter)`.
+pub fn string_agg<E, D>(expr: E, delimiter: D) -> Expr<String, Nullable>
+where
+    E: IntoExpr<String>,
+    D: IntoExpr<String>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "string_agg",
+        args: vec![
+            expr.into_expr().into_node(),
+            delimiter.into_expr().into_node(),
+        ],
+    })
+}
+
+/// Render `bool_and(expression)`.
+pub fn bool_and<E>(expr: E) -> Expr<bool, Nullable>
+where
+    E: IntoExpr<bool>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "bool_and",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `bool_or(expression)`.
+pub fn bool_or<E>(expr: E) -> Expr<bool, Nullable>
+where
+    E: IntoExpr<bool>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "bool_or",
         args: vec![expr.into_expr().into_node()],
     })
 }

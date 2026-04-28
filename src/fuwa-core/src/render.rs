@@ -1,5 +1,6 @@
 use postgres_types::ToSql;
 
+use crate::query::SelectDistinct;
 use crate::{
     quote_ident, ArithmeticOp, Assignment, BinaryOp, BindValue, DeleteQuery, Error, ExprNode,
     FieldRef, InsertQuery, Join, JoinKind, OrderDirection, OrderExpr, Result, SelectItem,
@@ -105,6 +106,9 @@ fn render_select<R>(query: SelectQuery<R>, renderer: &mut Renderer) -> Result<()
         .ok_or_else(|| Error::invalid_query_shape("SELECT requires a FROM table"))?;
 
     renderer.sql.push_str("select ");
+    if let Some(distinct) = query.distinct {
+        render_distinct(distinct, renderer)?;
+    }
     render_select_items(query.selection, renderer, FieldQualification::Qualified)?;
     renderer.sql.push_str(" from ");
     render_table(from, renderer)?;
@@ -115,6 +119,20 @@ fn render_select<R>(query: SelectQuery<R>, renderer: &mut Renderer) -> Result<()
 
     if let Some(condition) = query.where_clause {
         renderer.sql.push_str(" where ");
+        render_expr(
+            condition.into_node(),
+            renderer,
+            FieldQualification::Qualified,
+        )?;
+    }
+
+    if !query.group_by.is_empty() {
+        renderer.sql.push_str(" group by ");
+        render_expr_list(query.group_by, renderer, FieldQualification::Qualified)?;
+    }
+
+    if let Some(condition) = query.having {
+        renderer.sql.push_str(" having ");
         render_expr(
             condition.into_node(),
             renderer,
@@ -143,6 +161,25 @@ fn render_select<R>(query: SelectQuery<R>, renderer: &mut Renderer) -> Result<()
         renderer.push_i64_bind(offset);
     }
 
+    Ok(())
+}
+
+fn render_distinct(distinct: SelectDistinct, renderer: &mut Renderer) -> Result<()> {
+    match distinct {
+        SelectDistinct::Distinct => {
+            renderer.sql.push_str("distinct ");
+        }
+        SelectDistinct::DistinctOn(exprs) => {
+            if exprs.is_empty() {
+                return Err(Error::invalid_query_shape(
+                    "DISTINCT ON requires at least one expression",
+                ));
+            }
+            renderer.sql.push_str("distinct on (");
+            render_expr_list(exprs, renderer, FieldQualification::Qualified)?;
+            renderer.sql.push_str(") ");
+        }
+    }
     Ok(())
 }
 
@@ -265,6 +302,20 @@ fn render_select_items(
             renderer.sql.push_str(", ");
         }
         render_expr(item.expr, renderer, qualification)?;
+    }
+    Ok(())
+}
+
+fn render_expr_list(
+    exprs: Vec<ExprNode>,
+    renderer: &mut Renderer,
+    qualification: FieldQualification,
+) -> Result<()> {
+    for (index, expr) in exprs.into_iter().enumerate() {
+        if index > 0 {
+            renderer.sql.push_str(", ");
+        }
+        render_expr(expr, renderer, qualification)?;
     }
     Ok(())
 }
@@ -519,6 +570,7 @@ mod tests {
         pub const display_name: Field<String, Nullable> = Field::new(table, "display_name");
         pub const active: Field<bool, NotNull> = Field::new(table, "active");
         pub const signup_rank: Field<i32, NotNull> = Field::new(table, "signup_rank");
+        pub const ratio: Field<f32, NotNull> = Field::new(table, "ratio");
         pub const created_at: Field<i64, NotNull> = Field::new(table, "created_at");
         pub const profile: Field<serde_json::Value, Nullable> = Field::new(table, "profile");
     }
@@ -546,6 +598,63 @@ mod tests {
             r#"select "users"."id", "users"."email" from "public"."users""#
         );
         assert_eq!(query.binds().len(), 0);
+    }
+
+    #[test]
+    fn renders_distinct_select_snapshot() {
+        let query = Context::new()
+            .select(users::email)
+            .distinct()
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            r#"select distinct "users"."email" from "public"."users""#
+        );
+    }
+
+    #[test]
+    fn renders_distinct_on_select_snapshot() {
+        let query = Context::new()
+            .select((users::email, users::created_at))
+            .distinct_on((users::email,))
+            .from(users::table)
+            .order_by((users::email.asc(), users::created_at.desc()))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select distinct on ("users"."email") "users"."email", "#,
+                r#""users"."created_at" from "public"."users" "#,
+                r#"order by "users"."email" asc, "users"."created_at" desc"#
+            )
+        );
+    }
+
+    #[test]
+    fn renders_group_by_and_having_select_snapshot() {
+        let query = Context::new()
+            .select((posts::user_id, count_star()))
+            .from(posts::table)
+            .group_by(posts::user_id)
+            .having(count_star().gt(bind(1_i64)))
+            .order_by(posts::user_id.asc())
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "posts"."user_id", count(*) from "blog"."posts" "#,
+                r#"group by "posts"."user_id" having (count(*) > $1) "#,
+                r#"order by "posts"."user_id" asc"#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
     }
 
     #[test]
@@ -912,5 +1021,46 @@ mod tests {
             query.sql(),
             r#"select sum("users"."signup_rank") from "public"."users""#
         );
+    }
+
+    #[test]
+    fn aggregate_functions_render_snapshots_and_output_types() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<i32, Nullable>(min(users::signup_rank));
+        assert_expr_type::<i32, Nullable>(max(users::signup_rank));
+        assert_expr_type::<rust_decimal::Decimal, Nullable>(avg(users::signup_rank));
+        assert_expr_type::<rust_decimal::Decimal, Nullable>(avg(users::created_at));
+        assert_expr_type::<f64, Nullable>(avg(users::ratio));
+        assert_expr_type::<Vec<String>, Nullable>(array_agg(users::email));
+        assert_expr_type::<Vec<Option<String>>, Nullable>(array_agg(users::display_name));
+        assert_expr_type::<String, Nullable>(string_agg(users::email, bind(", ")));
+        assert_expr_type::<bool, Nullable>(bool_and(users::active));
+        assert_expr_type::<bool, Nullable>(bool_or(users::active));
+
+        let query = Context::new()
+            .select((
+                min(users::signup_rank),
+                max(users::signup_rank),
+                avg(users::signup_rank),
+                array_agg(users::email),
+                string_agg(users::email, bind(", ")),
+                bool_and(users::active),
+                bool_or(users::active),
+            ))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select min("users"."signup_rank"), max("users"."signup_rank"), "#,
+                r#"avg("users"."signup_rank"), array_agg("users"."email"), "#,
+                r#"string_agg("users"."email", $1), bool_and("users"."active"), "#,
+                r#"bool_or("users"."active") from "public"."users""#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
     }
 }
