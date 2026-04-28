@@ -21,7 +21,7 @@
 ```toml
 # Cargo.toml
 [dependencies]
-fuwa = { git = "ssh://git@github.com/taracutie/fuwa.git" }
+fuwa = { git = "https://github.com/taracutie/fuwa.git" }
 ```
 
 ### 2. create tables
@@ -49,8 +49,7 @@ create table public.posts (
 install the cli from the repo:
 
 ```sh
-CARGO_NET_GIT_FETCH_WITH_CLI=true \
-  cargo install --git ssh://git@github.com/taracutie/fuwa.git fuwa-codegen --locked
+cargo install --git https://github.com/taracutie/fuwa.git fuwa-codegen --locked
 ```
 
 generate a rust schema module:
