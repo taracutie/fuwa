@@ -4,7 +4,7 @@
 //! methods. Most applications should depend on this crate rather than the internal crates.
 
 pub use fuwa_core::*;
-pub use fuwa_postgres::{FromRow, PgFuture, PgQueryExt};
+pub use fuwa_postgres::{transaction, FromRow, PgFuture, PgQueryExt, TransactionFuture};
 
 /// Re-exported external types used by generated schema modules.
 pub mod types {
@@ -16,11 +16,11 @@ pub mod types {
 
 /// PostgreSQL-specific execution exports.
 pub mod postgres {
-    pub use fuwa_postgres::{FromRow, PgFuture, PgQueryExt, Row};
+    pub use fuwa_postgres::{transaction, FromRow, PgFuture, PgQueryExt, Row, TransactionFuture};
 }
 
 /// Common imports for hand-written queries and generated schema modules.
 pub mod prelude {
     pub use fuwa_core::prelude::*;
-    pub use fuwa_postgres::{FromRow, PgQueryExt};
+    pub use fuwa_postgres::{transaction, FromRow, PgQueryExt, TransactionFuture};
 }

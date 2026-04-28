@@ -1,5 +1,5 @@
 use fuwa_core::prelude::*;
-use fuwa_postgres::PgQueryExt;
+use fuwa_postgres::{transaction, PgQueryExt};
 use rust_decimal::Decimal;
 use tokio_postgres::NoTls;
 
@@ -12,6 +12,17 @@ mod users {
     pub const table: Table = Table::new("public", "fuwa_test_users");
     pub const id: Field<i64, NotNull> = Field::new(table, "id");
     pub const email: Field<String, NotNull> = Field::new(table, "email");
+    pub const active: Field<bool, NotNull> = Field::new(table, "active");
+}
+
+#[allow(non_upper_case_globals)]
+mod upsert_users {
+    use fuwa_core::prelude::*;
+
+    pub const table: Table = Table::new("public", "fuwa_test_upsert_users");
+    pub const id: Field<i64, NotNull> = Field::new(table, "id");
+    pub const email: Field<String, NotNull> = Field::new(table, "email");
+    pub const display_name: Field<String, Nullable> = Field::new(table, "display_name");
     pub const active: Field<bool, NotNull> = Field::new(table, "active");
 }
 
@@ -125,6 +136,160 @@ async fn postgres_round_trip_when_database_url_is_set() -> TestResult {
 
     client
         .batch_execute("drop table if exists public.fuwa_test_users;")
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!("skipping PostgreSQL integration test: FUWA_TEST_DATABASE_URL is not set");
+        return Ok(());
+    };
+
+    let (mut client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("PostgreSQL connection task failed: {err}");
+        }
+    });
+
+    client
+        .batch_execute(
+            r#"
+            drop table if exists public.fuwa_test_upsert_users;
+            create table public.fuwa_test_upsert_users (
+                id bigint primary key,
+                email text not null unique,
+                display_name text,
+                active boolean not null
+            );
+            "#,
+        )
+        .await?;
+
+    let ctx = Context::new();
+
+    let inserted = ctx
+        .insert_into(upsert_users::table)
+        .values_many([
+            (
+                upsert_users::id.set(bind(1_i64)),
+                upsert_users::email.set(bind("ada@example.com")),
+                upsert_users::display_name.set(bind(Some("Ada"))),
+                upsert_users::active.set(bind(true)),
+            ),
+            (
+                upsert_users::id.set(bind(2_i64)),
+                upsert_users::email.set(bind("ben@example.com")),
+                upsert_users::display_name.set(bind(Some("Ben"))),
+                upsert_users::active.set(bind(false)),
+            ),
+        ])
+        .execute(&client)
+        .await?;
+    assert_eq!(inserted, 2);
+
+    let rows = ctx
+        .select((upsert_users::id, upsert_users::email))
+        .from(upsert_users::table)
+        .order_by(upsert_users::id.asc())
+        .fetch_all::<(i64, String)>(&client)
+        .await?;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "ada@example.com".to_owned()),
+            (2, "ben@example.com".to_owned()),
+        ]
+    );
+
+    let ignored = ctx
+        .insert_into(upsert_users::table)
+        .values((
+            upsert_users::id.set(bind(3_i64)),
+            upsert_users::email.set(bind("ada@example.com")),
+            upsert_users::display_name.set(bind(Some("Changed"))),
+            upsert_users::active.set(bind(false)),
+        ))
+        .on_conflict((upsert_users::email,))
+        .do_nothing()
+        .returning(upsert_users::id)
+        .fetch_optional::<i64>(&client)
+        .await?;
+    assert_eq!(ignored, None);
+
+    let unchanged = ctx
+        .select((upsert_users::display_name, upsert_users::active))
+        .from(upsert_users::table)
+        .where_(upsert_users::email.eq(bind("ada@example.com")))
+        .fetch_one::<(Option<String>, bool)>(&client)
+        .await?;
+    assert_eq!(unchanged, (Some("Ada".to_owned()), true));
+
+    let updated = ctx
+        .insert_into(upsert_users::table)
+        .values((
+            upsert_users::id.set(bind(4_i64)),
+            upsert_users::email.set(bind("ben@example.com")),
+            upsert_users::display_name.set(bind(Some("Benedict"))),
+            upsert_users::active.set(bind(true)),
+        ))
+        .on_conflict((upsert_users::email,))
+        .do_update(|excluded| {
+            (
+                upsert_users::display_name.set(excluded.field(upsert_users::display_name)),
+                upsert_users::active.set(excluded.field(upsert_users::active)),
+            )
+        })
+        .returning((
+            upsert_users::id,
+            upsert_users::display_name,
+            upsert_users::active,
+        ))
+        .fetch_one::<(i64, Option<String>, bool)>(&client)
+        .await?;
+    assert_eq!(updated, (2, Some("Benedict".to_owned()), true));
+
+    let tx_result = transaction(&mut client, |tx| {
+        Box::pin(async move {
+            ctx.insert_into(upsert_users::table)
+                .values((
+                    upsert_users::id.set(bind(5_i64)),
+                    upsert_users::email.set(bind("rolled-back@example.com")),
+                    upsert_users::display_name.set(bind(Some("Rollback"))),
+                    upsert_users::active.set(bind(true)),
+                ))
+                .execute(tx)
+                .await?;
+
+            ctx.insert_into(upsert_users::table)
+                .values((
+                    upsert_users::id.set(bind(1_i64)),
+                    upsert_users::email.set(bind("duplicate-id@example.com")),
+                    upsert_users::display_name.set(bind(None::<String>)),
+                    upsert_users::active.set(bind(true)),
+                ))
+                .execute(tx)
+                .await?;
+
+            Ok(())
+        })
+    })
+    .await;
+    assert!(tx_result.is_err());
+
+    let rolled_back_count = ctx
+        .select(count_star())
+        .from(upsert_users::table)
+        .where_(upsert_users::email.eq(bind("rolled-back@example.com")))
+        .fetch_one::<i64>(&client)
+        .await?;
+    assert_eq!(rolled_back_count, 0);
+
+    client
+        .batch_execute("drop table if exists public.fuwa_test_upsert_users;")
         .await?;
 
     Ok(())

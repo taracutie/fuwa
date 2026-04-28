@@ -1,6 +1,6 @@
 use postgres_types::ToSql;
 
-use crate::query::SelectDistinct;
+use crate::query::{InsertConflict, SelectDistinct};
 use crate::{
     quote_ident, ArithmeticOp, Assignment, BinaryOp, BindValue, DeleteQuery, Error, ExprNode,
     FieldRef, InsertQuery, Join, JoinKind, OrderDirection, OrderExpr, Result, SelectItem,
@@ -184,17 +184,17 @@ fn render_distinct(distinct: SelectDistinct, renderer: &mut Renderer) -> Result<
 }
 
 fn render_insert<R>(query: InsertQuery<R>, renderer: &mut Renderer) -> Result<()> {
-    if query.assignments.is_empty() {
+    if query.rows.is_empty() {
         return Err(Error::invalid_query_shape(
             "INSERT requires at least one value",
         ));
     }
-    validate_assignments_target(query.table, &query.assignments)?;
+    validate_insert_rows(query.table, &query.rows)?;
 
     renderer.sql.push_str("insert into ");
     render_table(query.table, renderer)?;
     renderer.sql.push_str(" (");
-    for (index, assignment) in query.assignments.iter().enumerate() {
+    for (index, assignment) in query.rows[0].iter().enumerate() {
         if index > 0 {
             renderer.sql.push_str(", ");
         }
@@ -202,19 +202,100 @@ fn render_insert<R>(query: InsertQuery<R>, renderer: &mut Renderer) -> Result<()
             .sql
             .push_str(&quote_ident(assignment.field.name())?);
     }
-    renderer.sql.push_str(") values (");
-    for (index, assignment) in query.assignments.into_iter().enumerate() {
-        if index > 0 {
+
+    renderer.sql.push_str(") values ");
+    for (row_index, row) in query.rows.into_iter().enumerate() {
+        if row_index > 0 {
             renderer.sql.push_str(", ");
         }
-        render_expr(assignment.value, renderer, FieldQualification::Qualified)?;
+        renderer.sql.push('(');
+        for (assignment_index, assignment) in row.into_iter().enumerate() {
+            if assignment_index > 0 {
+                renderer.sql.push_str(", ");
+            }
+            render_expr(assignment.value, renderer, FieldQualification::Qualified)?;
+        }
+        renderer.sql.push(')');
     }
-    renderer.sql.push(')');
+
+    if let Some(on_conflict) = query.on_conflict {
+        render_insert_conflict(query.table, on_conflict, renderer)?;
+    }
 
     if !query.returning.is_empty() {
         renderer.sql.push_str(" returning ");
         render_select_items(query.returning, renderer, FieldQualification::Unqualified)?;
     }
+
+    Ok(())
+}
+
+fn render_insert_conflict(
+    table: Table,
+    on_conflict: InsertConflict,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    match on_conflict {
+        InsertConflict::DoNothing { target } => {
+            render_conflict_target(table, target, renderer)?;
+            renderer.sql.push_str(" do nothing");
+        }
+        InsertConflict::DoUpdate {
+            target,
+            assignments,
+        } => {
+            if assignments.is_empty() {
+                return Err(Error::invalid_query_shape(
+                    "ON CONFLICT DO UPDATE requires at least one assignment",
+                ));
+            }
+            validate_assignments_target(table, &assignments)?;
+            render_conflict_target(table, target, renderer)?;
+            renderer.sql.push_str(" do update set ");
+            for (index, assignment) in assignments.into_iter().enumerate() {
+                if index > 0 {
+                    renderer.sql.push_str(", ");
+                }
+                renderer
+                    .sql
+                    .push_str(&quote_ident(assignment.field.name())?);
+                renderer.sql.push_str(" = ");
+                render_expr_with_excluded_target(assignment.value, renderer, table)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn render_conflict_target(
+    table: Table,
+    target: Vec<FieldRef>,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    if target.is_empty() {
+        return Err(Error::invalid_query_shape(
+            "ON CONFLICT requires at least one target field",
+        ));
+    }
+    for field in &target {
+        if !field.table().same_identity(table) {
+            return Err(Error::invalid_query_shape(format!(
+                "conflict target field {} does not belong to target table {}",
+                field.name(),
+                table.name()
+            )));
+        }
+    }
+
+    renderer.sql.push_str(" on conflict (");
+    for (index, field) in target.into_iter().enumerate() {
+        if index > 0 {
+            renderer.sql.push_str(", ");
+        }
+        renderer.sql.push_str(&quote_ident(field.name())?);
+    }
+    renderer.sql.push(')');
 
     Ok(())
 }
@@ -289,6 +370,44 @@ fn validate_assignments_target(table: Table, assignments: &[Assignment]) -> Resu
             )));
         }
     }
+    Ok(())
+}
+
+fn validate_insert_rows(table: Table, rows: &[Vec<Assignment>]) -> Result<()> {
+    let first_row = rows
+        .first()
+        .ok_or_else(|| Error::invalid_query_shape("INSERT requires at least one value"))?;
+    if first_row.is_empty() {
+        return Err(Error::invalid_query_shape(
+            "INSERT requires at least one value",
+        ));
+    }
+    validate_assignments_target(table, first_row)?;
+
+    let first_fields: Vec<FieldRef> = first_row
+        .iter()
+        .map(|assignment| assignment.field)
+        .collect();
+
+    for row in rows.iter().skip(1) {
+        if row.is_empty() {
+            return Err(Error::invalid_query_shape(
+                "INSERT requires at least one value per row",
+            ));
+        }
+        validate_assignments_target(table, row)?;
+
+        let fields_match = row
+            .iter()
+            .map(|assignment| assignment.field)
+            .eq(first_fields.iter().copied());
+        if !fields_match {
+            return Err(Error::invalid_query_shape(
+                "INSERT rows must assign the same fields in the same order",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -367,16 +486,39 @@ enum FieldQualification {
     Unqualified,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExprRenderContext {
+    qualification: FieldQualification,
+    excluded_target: Option<Table>,
+}
+
+impl ExprRenderContext {
+    const fn new(qualification: FieldQualification) -> Self {
+        Self {
+            qualification,
+            excluded_target: None,
+        }
+    }
+
+    const fn for_excluded_target(table: Table) -> Self {
+        Self {
+            qualification: FieldQualification::Qualified,
+            excluded_target: Some(table),
+        }
+    }
+}
+
 fn render_field_ref(
     field: FieldRef,
     renderer: &mut Renderer,
-    qualification: FieldQualification,
+    context: ExprRenderContext,
 ) -> Result<()> {
-    if matches!(qualification, FieldQualification::Qualified) {
-        let qualifier = field
-            .table()
-            .alias()
-            .unwrap_or_else(|| field.table().name());
+    if matches!(context.qualification, FieldQualification::Qualified) {
+        let table = context
+            .excluded_target
+            .filter(|target| field.table().same_identity(*target))
+            .unwrap_or_else(|| field.table());
+        let qualifier = table.alias().unwrap_or_else(|| table.name());
         renderer.sql.push_str(&quote_ident(qualifier)?);
         renderer.sql.push('.');
     }
@@ -389,19 +531,56 @@ fn render_expr(
     renderer: &mut Renderer,
     qualification: FieldQualification,
 ) -> Result<()> {
+    render_expr_with_context(expr, renderer, ExprRenderContext::new(qualification))
+}
+
+fn render_expr_with_excluded_target(
+    expr: ExprNode,
+    renderer: &mut Renderer,
+    table: Table,
+) -> Result<()> {
+    render_expr_with_context(
+        expr,
+        renderer,
+        ExprRenderContext::for_excluded_target(table),
+    )
+}
+
+fn render_expr_with_context(
+    expr: ExprNode,
+    renderer: &mut Renderer,
+    context: ExprRenderContext,
+) -> Result<()> {
     match expr {
-        ExprNode::Field(field) => render_field_ref(field, renderer, qualification),
+        ExprNode::Field(field) => render_field_ref(field, renderer, context),
+        ExprNode::ExcludedField(field) => {
+            let Some(table) = context.excluded_target else {
+                return Err(Error::invalid_query_shape(
+                    "excluded fields are only valid in ON CONFLICT DO UPDATE assignments",
+                ));
+            };
+            if !field.table().same_identity(table) {
+                return Err(Error::invalid_query_shape(format!(
+                    "excluded field {} does not belong to target table {}",
+                    field.name(),
+                    table.name()
+                )));
+            }
+            renderer.sql.push_str("excluded.");
+            renderer.sql.push_str(&quote_ident(field.name())?);
+            Ok(())
+        }
         ExprNode::Bind(bind) => {
             renderer.push_bind(bind.into_value());
             Ok(())
         }
         ExprNode::Binary { op, left, right } => {
             renderer.sql.push('(');
-            render_expr(*left, renderer, qualification)?;
+            render_expr_with_context(*left, renderer, context)?;
             renderer.sql.push(' ');
             renderer.sql.push_str(binary_op_sql(op));
             renderer.sql.push(' ');
-            render_expr(*right, renderer, qualification)?;
+            render_expr_with_context(*right, renderer, context)?;
             renderer.sql.push(')');
             Ok(())
         }
@@ -410,13 +589,13 @@ fn render_expr(
             renderer.sql.push_str(match op {
                 UnaryOp::Not => "not ",
             });
-            render_expr(*expr, renderer, qualification)?;
+            render_expr_with_context(*expr, renderer, context)?;
             renderer.sql.push(')');
             Ok(())
         }
         ExprNode::IsNull { expr, negated } => {
             renderer.sql.push('(');
-            render_expr(*expr, renderer, qualification)?;
+            render_expr_with_context(*expr, renderer, context)?;
             if negated {
                 renderer.sql.push_str(" is not null");
             } else {
@@ -437,7 +616,7 @@ fn render_expr(
             }
 
             renderer.sql.push('(');
-            render_expr(*expr, renderer, qualification)?;
+            render_expr_with_context(*expr, renderer, context)?;
             if negated {
                 renderer.sql.push_str(" not in (");
             } else {
@@ -447,7 +626,7 @@ fn render_expr(
                 if index > 0 {
                     renderer.sql.push_str(", ");
                 }
-                render_expr(item, renderer, qualification)?;
+                render_expr_with_context(item, renderer, context)?;
             }
             renderer.sql.push_str("))");
             Ok(())
@@ -459,33 +638,33 @@ fn render_expr(
             negated,
         } => {
             renderer.sql.push('(');
-            render_expr(*expr, renderer, qualification)?;
+            render_expr_with_context(*expr, renderer, context)?;
             if negated {
                 renderer.sql.push_str(" not between ");
             } else {
                 renderer.sql.push_str(" between ");
             }
-            render_expr(*low, renderer, qualification)?;
+            render_expr_with_context(*low, renderer, context)?;
             renderer.sql.push_str(" and ");
-            render_expr(*high, renderer, qualification)?;
+            render_expr_with_context(*high, renderer, context)?;
             renderer.sql.push(')');
             Ok(())
         }
         ExprNode::Arithmetic { op, left, right } => {
             renderer.sql.push('(');
-            render_expr(*left, renderer, qualification)?;
+            render_expr_with_context(*left, renderer, context)?;
             renderer.sql.push(' ');
             renderer.sql.push_str(arithmetic_op_sql(op));
             renderer.sql.push(' ');
-            render_expr(*right, renderer, qualification)?;
+            render_expr_with_context(*right, renderer, context)?;
             renderer.sql.push(')');
             Ok(())
         }
         ExprNode::StringConcat { left, right } => {
             renderer.sql.push('(');
-            render_expr(*left, renderer, qualification)?;
+            render_expr_with_context(*left, renderer, context)?;
             renderer.sql.push_str(" || ");
-            render_expr(*right, renderer, qualification)?;
+            render_expr_with_context(*right, renderer, context)?;
             renderer.sql.push(')');
             Ok(())
         }
@@ -496,7 +675,7 @@ fn render_expr(
                 if index > 0 {
                     renderer.sql.push_str(", ");
                 }
-                render_expr(arg, renderer, qualification)?;
+                render_expr_with_context(arg, renderer, context)?;
             }
             renderer.sql.push(')');
             Ok(())
@@ -514,13 +693,13 @@ fn render_expr(
             renderer.sql.push_str("(case");
             for (condition, value) in branches {
                 renderer.sql.push_str(" when ");
-                render_expr(condition, renderer, qualification)?;
+                render_expr_with_context(condition, renderer, context)?;
                 renderer.sql.push_str(" then ");
-                render_expr(value, renderer, qualification)?;
+                render_expr_with_context(value, renderer, context)?;
             }
             if let Some(else_expr) = else_expr {
                 renderer.sql.push_str(" else ");
-                render_expr(*else_expr, renderer, qualification)?;
+                render_expr_with_context(*else_expr, renderer, context)?;
             }
             renderer.sql.push_str(" end)");
             Ok(())
@@ -766,6 +945,189 @@ mod tests {
             )
         );
         assert_eq!(query.binds().len(), 2);
+    }
+
+    #[test]
+    fn renders_multi_row_insert() {
+        let query = Context::new()
+            .insert_into(users::table)
+            .values_many([
+                (
+                    users::email.set(bind("a@example.com")),
+                    users::active.set(bind(true)),
+                ),
+                (
+                    users::email.set(bind("b@example.com")),
+                    users::active.set(bind(false)),
+                ),
+            ])
+            .returning(users::id)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"insert into "public"."users" ("email", "active") "#,
+                r#"values ($1, $2), ($3, $4) returning "id""#
+            )
+        );
+        assert_eq!(query.binds().len(), 4);
+    }
+
+    #[test]
+    fn multi_row_insert_requires_matching_fields() {
+        let result = Context::new()
+            .insert_into(users::table)
+            .values_many([
+                (
+                    users::email.set(bind("a@example.com")),
+                    users::active.set(bind(true)),
+                ),
+                (
+                    users::active.set(bind(false)),
+                    users::email.set(bind("b@example.com")),
+                ),
+            ])
+            .render();
+
+        assert!(
+            matches!(result, Err(Error::InvalidQueryShape(message)) if message.contains("same fields"))
+        );
+    }
+
+    #[test]
+    fn empty_multi_row_insert_is_invalid_query_shape() {
+        let result = Context::new()
+            .insert_into(users::table)
+            .values_many(Vec::<Assignment>::new())
+            .render();
+
+        assert!(
+            matches!(result, Err(Error::InvalidQueryShape(message)) if message.contains("INSERT requires"))
+        );
+    }
+
+    #[test]
+    fn renders_insert_on_conflict_do_nothing() {
+        let query = Context::new()
+            .insert_into(users::table)
+            .values((
+                users::email.set(bind("a@example.com")),
+                users::active.set(bind(true)),
+            ))
+            .on_conflict((users::email,))
+            .do_nothing()
+            .returning(users::id)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"insert into "public"."users" ("email", "active") values ($1, $2) "#,
+                r#"on conflict ("email") do nothing returning "id""#
+            )
+        );
+        assert_eq!(query.binds().len(), 2);
+    }
+
+    #[test]
+    fn renders_insert_on_conflict_do_update_with_excluded() {
+        let query = Context::new()
+            .insert_into(users::table)
+            .values((
+                users::email.set(bind("a@example.com")),
+                users::display_name.set(bind(Some("Ada"))),
+                users::active.set(bind(true)),
+            ))
+            .on_conflict((users::email,))
+            .do_update(|excluded| {
+                (
+                    users::display_name.set(excluded.field(users::display_name)),
+                    users::active.set(excluded.field(users::active)),
+                )
+            })
+            .returning((users::id, users::display_name))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"insert into "public"."users" ("email", "display_name", "active") "#,
+                r#"values ($1, $2, $3) on conflict ("email") do update set "#,
+                r#""display_name" = excluded."display_name", "#,
+                r#""active" = excluded."active" returning "id", "display_name""#
+            )
+        );
+        assert_eq!(query.binds().len(), 3);
+    }
+
+    #[test]
+    fn renders_aliased_insert_on_conflict_do_update_target_field_refs() {
+        let query = Context::new()
+            .insert_into(users::table.as_("u"))
+            .values((
+                users::email.set(bind("a@example.com")),
+                users::signup_rank.set(bind(1_i32)),
+            ))
+            .on_conflict((users::email,))
+            .do_update(|excluded| {
+                (
+                    users::signup_rank.set(users::signup_rank.expr() + bind(1_i32)),
+                    users::display_name.set(excluded.field(users::display_name)),
+                )
+            })
+            .returning((users::id, users::signup_rank))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"insert into "public"."users" as "u" ("email", "signup_rank") "#,
+                r#"values ($1, $2) on conflict ("email") do update set "#,
+                r#""signup_rank" = ("u"."signup_rank" + $3), "#,
+                r#""display_name" = excluded."display_name" returning "id", "signup_rank""#
+            )
+        );
+        assert_eq!(query.binds().len(), 3);
+    }
+
+    #[test]
+    fn insert_on_conflict_do_update_rejects_excluded_field_from_other_table() {
+        let result = Context::new()
+            .insert_into(users::table)
+            .values((
+                users::id.set(bind(1_i64)),
+                users::email.set(bind("a@example.com")),
+            ))
+            .on_conflict((users::email,))
+            .do_update(|excluded| users::id.set(excluded.field(posts::id)))
+            .render();
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidQueryShape(message))
+                if message.contains("excluded field id")
+                    && message.contains("target table users")
+        ));
+    }
+
+    #[test]
+    fn excluded_field_outside_on_conflict_do_update_is_invalid_query_shape() {
+        let result = Context::new()
+            .select(Excluded.field(users::id))
+            .from(users::table)
+            .render();
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidQueryShape(message))
+                if message.contains("excluded fields")
+                    && message.contains("ON CONFLICT DO UPDATE")
+        ));
     }
 
     #[test]

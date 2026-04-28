@@ -36,7 +36,8 @@ impl Context {
     pub fn insert_into(&self, table: Table) -> InsertQuery<()> {
         InsertQuery {
             table,
-            assignments: Vec::new(),
+            rows: Vec::new(),
+            on_conflict: None,
             returning: Vec::new(),
             marker: PhantomData,
         }
@@ -292,11 +293,75 @@ impl_tuple_assignments!(A a, B b, C c, D d, E e, F f);
 impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g);
 impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h);
 
+/// A field reference that resolves to PostgreSQL's `excluded` pseudo-table.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Excluded;
+
+impl Excluded {
+    pub fn field<T, N>(self, field: Field<T, N>) -> Expr<T, N> {
+        Expr::from_node(ExprNode::ExcludedField(FieldRef::new(
+            field.table(),
+            field.name(),
+        )))
+    }
+}
+
+/// A field list accepted by `ON CONFLICT`.
+pub trait ConflictTarget {
+    fn into_conflict_fields(self) -> Vec<FieldRef>;
+}
+
+impl<T, N> ConflictTarget for Field<T, N> {
+    fn into_conflict_fields(self) -> Vec<FieldRef> {
+        vec![FieldRef::new(self.table(), self.name())]
+    }
+}
+
+macro_rules! impl_tuple_conflict_target {
+    ($($ty:ident $var:ident),+ $(,)?) => {
+        impl<$($ty),+> ConflictTarget for ($($ty,)+)
+        where
+            $($ty: ConflictTarget),+
+        {
+            fn into_conflict_fields(self) -> Vec<FieldRef> {
+                let ($($var,)+) = self;
+                let mut fields = Vec::new();
+                $(
+                    fields.extend($var.into_conflict_fields());
+                )+
+                fields
+            }
+        }
+    };
+}
+
+impl_tuple_conflict_target!(A a);
+impl_tuple_conflict_target!(A a, B b);
+impl_tuple_conflict_target!(A a, B b, C c);
+impl_tuple_conflict_target!(A a, B b, C c, D d);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h);
+
+/// `ON CONFLICT` behavior for an `INSERT`.
+#[derive(Debug)]
+pub(crate) enum InsertConflict {
+    DoNothing {
+        target: Vec<FieldRef>,
+    },
+    DoUpdate {
+        target: Vec<FieldRef>,
+        assignments: Vec<Assignment>,
+    },
+}
+
 /// An `INSERT` query.
 #[derive(Debug)]
 pub struct InsertQuery<R = ()> {
     pub(crate) table: Table,
-    pub(crate) assignments: Vec<Assignment>,
+    pub(crate) rows: Vec<Vec<Assignment>>,
+    pub(crate) on_conflict: Option<InsertConflict>,
     pub(crate) returning: Vec<SelectItem>,
     marker: PhantomData<fn() -> R>,
 }
@@ -306,8 +371,30 @@ impl<R> InsertQuery<R> {
     where
         A: Assignments,
     {
-        self.assignments = assignments.into_assignments();
+        self.rows = vec![assignments.into_assignments()];
         self
+    }
+
+    pub fn values_many<I, A>(mut self, rows: I) -> Self
+    where
+        I: IntoIterator<Item = A>,
+        A: Assignments,
+    {
+        self.rows = rows
+            .into_iter()
+            .map(Assignments::into_assignments)
+            .collect();
+        self
+    }
+
+    pub fn on_conflict<T>(self, target: T) -> InsertConflictBuilder<R>
+    where
+        T: ConflictTarget,
+    {
+        InsertConflictBuilder {
+            query: self,
+            target: target.into_conflict_fields(),
+        }
     }
 
     pub fn returning<S>(self, selection: S) -> InsertQuery<S::Record>
@@ -316,7 +403,8 @@ impl<R> InsertQuery<R> {
     {
         InsertQuery {
             table: self.table,
-            assignments: self.assignments,
+            rows: self.rows,
+            on_conflict: self.on_conflict,
             returning: selection.into_select_items(),
             marker: PhantomData,
         }
@@ -324,6 +412,34 @@ impl<R> InsertQuery<R> {
 
     pub fn render(self) -> Result<RenderedQuery> {
         RenderQuery::render(self)
+    }
+}
+
+/// Builder returned after `INSERT ... ON CONFLICT (...)`.
+#[derive(Debug)]
+pub struct InsertConflictBuilder<R = ()> {
+    query: InsertQuery<R>,
+    target: Vec<FieldRef>,
+}
+
+impl<R> InsertConflictBuilder<R> {
+    pub fn do_nothing(mut self) -> InsertQuery<R> {
+        self.query.on_conflict = Some(InsertConflict::DoNothing {
+            target: self.target,
+        });
+        self.query
+    }
+
+    pub fn do_update<F, A>(mut self, f: F) -> InsertQuery<R>
+    where
+        F: FnOnce(Excluded) -> A,
+        A: Assignments,
+    {
+        self.query.on_conflict = Some(InsertConflict::DoUpdate {
+            target: self.target,
+            assignments: f(Excluded).into_assignments(),
+        });
+        self.query
     }
 }
 

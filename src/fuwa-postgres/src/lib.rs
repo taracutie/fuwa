@@ -6,10 +6,42 @@ use std::pin::Pin;
 use fuwa_core::{Error, RenderQuery, Result};
 use tokio_postgres::types::FromSqlOwned;
 pub use tokio_postgres::Row;
-use tokio_postgres::{GenericClient, Row as PgRow};
+use tokio_postgres::{GenericClient, Row as PgRow, Transaction};
 
 /// Boxed future returned by `fuwa-postgres` extension methods.
 pub type PgFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Boxed future returned by transaction callbacks.
+pub type TransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Run a closure inside a PostgreSQL transaction.
+pub async fn transaction<C, F, T>(client: &mut C, f: F) -> Result<T>
+where
+    C: GenericClient,
+    F: for<'a> FnOnce(&'a Transaction<'a>) -> TransactionFuture<'a, T>,
+{
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|err| Error::execution(err.to_string()))?;
+
+    match f(&tx).await {
+        Ok(value) => {
+            tx.commit()
+                .await
+                .map_err(|err| Error::execution(err.to_string()))?;
+            Ok(value)
+        }
+        Err(err) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                return Err(Error::execution(format!(
+                    "transaction rollback failed: {rollback_err}"
+                )));
+            }
+            Err(err)
+        }
+    }
+}
 
 /// Decode a `tokio-postgres` row into a Rust value.
 pub trait FromRow: Sized {

@@ -210,6 +210,7 @@ impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H);
 #[derive(Debug)]
 pub enum ExprNode {
     Field(FieldRef),
+    ExcludedField(FieldRef),
     Bind(BindParam),
     Binary {
         op: BinaryOp,

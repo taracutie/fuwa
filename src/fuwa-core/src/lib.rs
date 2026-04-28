@@ -24,8 +24,9 @@ pub use expr::{
 };
 pub use ident::quote_ident;
 pub use query::{
-    Assignment, Assignments, Context, DeleteQuery, ExprList, InsertQuery, Join, JoinKind,
-    JoinTarget, OrderByList, SelectQuery, UpdateQuery,
+    Assignment, Assignments, ConflictTarget, Context, DeleteQuery, Excluded, ExprList,
+    InsertConflictBuilder, InsertQuery, Join, JoinKind, JoinTarget, OrderByList, SelectQuery,
+    UpdateQuery,
 };
 pub use raw::{raw, RawQuery};
 pub use render::{RenderQuery, RenderedQuery};
@@ -38,8 +39,9 @@ pub mod prelude {
         array_agg, avg, bind, bool_and, bool_or, case_when, coalesce, concat, count, count_star,
         jsonb_array_length, max, min, not, nullable, nullif, raw, selection_as, string_agg, sum,
         ArrayAggInput, Assignment, Assignments, AvgOutput, CaseWhen, CaseWhenStart, Condition,
-        Context, DeleteQuery, Error, Expr, ExprList, Field, InsertQuery, IntoExpr, NotNull,
-        Nullable, OrderByList, OrderDirection, OrderExpr, RawQuery, RenderQuery, RenderedQuery,
-        Result, SelectQuery, Selectable, SumOutput, Table, UpdateQuery,
+        ConflictTarget, Context, DeleteQuery, Error, Excluded, Expr, ExprList, Field,
+        InsertConflictBuilder, InsertQuery, IntoExpr, NotNull, Nullable, OrderByList,
+        OrderDirection, OrderExpr, RawQuery, RenderQuery, RenderedQuery, Result, SelectQuery,
+        Selectable, SumOutput, Table, UpdateQuery,
     };
 }
