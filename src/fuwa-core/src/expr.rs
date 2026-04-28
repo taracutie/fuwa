@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
 use std::ops::Not;
 
+use rust_decimal::Decimal;
+
 use crate::{BindParam, Field, NotNull, Nullable, Table};
 
 /// Reference to a field in the AST.
@@ -387,10 +389,40 @@ pub fn count_star() -> Expr<i64, NotNull> {
     })
 }
 
+/// PostgreSQL return type for `sum(expression)`.
+pub trait SumOutput {
+    type Output;
+}
+
+impl SumOutput for i16 {
+    type Output = i64;
+}
+
+impl SumOutput for i32 {
+    type Output = i64;
+}
+
+impl SumOutput for i64 {
+    type Output = Decimal;
+}
+
+impl SumOutput for Decimal {
+    type Output = Decimal;
+}
+
+impl SumOutput for f32 {
+    type Output = f32;
+}
+
+impl SumOutput for f64 {
+    type Output = f64;
+}
+
 /// Render `sum(expression)`.
-pub fn sum<T, E>(expr: E) -> Expr<T, Nullable>
+pub fn sum<T, E>(expr: E) -> Expr<T::Output, Nullable>
 where
     E: IntoExpr<T>,
+    T: SumOutput,
 {
     Expr::from_node(ExprNode::Function {
         name: "sum",

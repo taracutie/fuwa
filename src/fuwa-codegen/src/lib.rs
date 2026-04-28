@@ -323,7 +323,7 @@ pub fn map_pg_type_with_kind(pg_type: &str, pg_type_kind: &str) -> Result<RustTy
         "int8" => "i64",
         "float4" => "f32",
         "float8" => "f64",
-        "numeric" => "f64",
+        "numeric" => "fuwa::types::Decimal",
         "bool" => "bool",
         "bytea" => "Vec<u8>",
         "text" | "varchar" | "bpchar" => "String",
@@ -337,7 +337,7 @@ pub fn map_pg_type_with_kind(pg_type: &str, pg_type_kind: &str) -> Result<RustTy
         "_int8" => "Vec<i64>",
         "_float4" => "Vec<f32>",
         "_float8" => "Vec<f64>",
-        "_numeric" => "Vec<f64>",
+        "_numeric" => "Vec<fuwa::types::Decimal>",
         "_bool" => "Vec<bool>",
         "_text" | "_varchar" | "_bpchar" => "Vec<String>",
         "_uuid" => "Vec<fuwa::types::Uuid>",
@@ -574,8 +574,14 @@ mod tests {
         assert_eq!(map_pg_type("int8").unwrap().path(), "i64");
         assert_eq!(map_pg_type("varchar").unwrap().path(), "String");
         assert_eq!(map_pg_type("bytea").unwrap().path(), "Vec<u8>");
-        assert_eq!(map_pg_type("numeric").unwrap().path(), "f64");
-        assert_eq!(map_pg_type("_numeric").unwrap().path(), "Vec<f64>");
+        assert_eq!(
+            map_pg_type("numeric").unwrap().path(),
+            "fuwa::types::Decimal"
+        );
+        assert_eq!(
+            map_pg_type("_numeric").unwrap().path(),
+            "Vec<fuwa::types::Decimal>"
+        );
         assert_eq!(map_pg_type("jsonb").unwrap().path(), "fuwa::types::Value");
         assert_eq!(map_pg_type("_int4").unwrap().path(), "Vec<i32>");
         assert_eq!(map_pg_type("_text").unwrap().path(), "Vec<String>");
@@ -643,6 +649,26 @@ mod tests {
                         default_expression: None,
                         primary_key: false,
                     },
+                    ColumnDef {
+                        name: "score".to_owned(),
+                        ordinal_position: 4,
+                        pg_type: "numeric".to_owned(),
+                        pg_type_kind: "b".to_owned(),
+                        rust_type: map_pg_type("numeric").unwrap(),
+                        nullable: false,
+                        default_expression: None,
+                        primary_key: false,
+                    },
+                    ColumnDef {
+                        name: "adjustments".to_owned(),
+                        ordinal_position: 5,
+                        pg_type: "_numeric".to_owned(),
+                        pg_type_kind: "b".to_owned(),
+                        rust_type: map_pg_type("_numeric").unwrap(),
+                        nullable: true,
+                        default_expression: None,
+                        primary_key: false,
+                    },
                 ],
             }],
         };
@@ -653,8 +679,14 @@ mod tests {
         assert!(generated.contains("pub const id: Field<i64, NotNull>"));
         assert!(generated.contains("pub const user_id: Field<String, Nullable>"));
         assert!(generated.contains("pub const recent_images: Field<Vec<String>, NotNull>"));
+        assert!(generated.contains("pub const score: Field<fuwa::types::Decimal, NotNull>"));
+        assert!(
+            generated.contains("pub const adjustments: Field<Vec<fuwa::types::Decimal>, Nullable>")
+        );
         assert!(generated.contains("pub user_id: Option<String>"));
         assert!(generated.contains("pub recent_images: Vec<String>"));
+        assert!(generated.contains("pub score: fuwa::types::Decimal"));
+        assert!(generated.contains("pub adjustments: Option<Vec<fuwa::types::Decimal>>"));
         assert!(generated.contains("impl fuwa::FromRow for Record"));
         assert!(generated.contains("pub struct All"));
         assert!(generated.contains("items.extend(id.into_select_items())"));

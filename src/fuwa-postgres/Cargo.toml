@@ -9,7 +9,8 @@ description = "tokio-postgres execution support for fuwa"
 
 [dependencies]
 chrono.workspace = true
-fuwa-core = { path = "../fuwa-core" }
+fuwa-core = { version = "0.1.0", path = "../fuwa-core" }
+rust_decimal.workspace = true
 serde_json.workspace = true
 tokio-postgres.workspace = true
 uuid.workspace = true

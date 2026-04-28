@@ -1,5 +1,6 @@
 use fuwa_core::prelude::*;
 use fuwa_postgres::PgQueryExt;
+use rust_decimal::Decimal;
 use tokio_postgres::NoTls;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -17,6 +18,7 @@ mod users {
 #[allow(non_upper_case_globals)]
 mod accounts {
     use fuwa_core::prelude::*;
+    use rust_decimal::Decimal;
 
     pub const table: Table = Table::new("fuwa_it_complex", "accounts");
     pub const id: Field<i64, NotNull> = Field::new(table, "id");
@@ -24,6 +26,7 @@ mod accounts {
     pub const display_name: Field<String, Nullable> = Field::new(table, "display_name");
     pub const active: Field<bool, NotNull> = Field::new(table, "active");
     pub const signup_rank: Field<i32, NotNull> = Field::new(table, "signup_rank");
+    pub const account_balance: Field<Decimal, NotNull> = Field::new(table, "account_balance");
 }
 
 #[allow(non_upper_case_globals)]
@@ -152,7 +155,8 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
                 email text not null unique,
                 display_name text,
                 active boolean not null,
-                signup_rank integer not null
+                signup_rank integer not null,
+                account_balance numeric not null
             );
 
             create table fuwa_it_complex.posts (
@@ -176,12 +180,12 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
             );
 
             insert into fuwa_it_complex.accounts
-                (id, email, display_name, active, signup_rank)
+                (id, email, display_name, active, signup_rank, account_balance)
             values
-                (1, 'ada@example.com', 'Ada', true, 10),
-                (2, 'ben@example.com', null, false, 20),
-                (3, 'cy@example.com', null, true, 30),
-                (4, 'dana@example.com', null, true, 40);
+                (1, 'ada@example.com', 'Ada', true, 10, 10.25),
+                (2, 'ben@example.com', null, false, 20, 20.50),
+                (3, 'cy@example.com', null, true, 30, 30.25),
+                (4, 'dana@example.com', null, true, 40, 40.00);
 
             insert into fuwa_it_complex.posts
                 (id, account_id, title, published, score, body)
@@ -274,6 +278,40 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         high_rank_accounts,
         vec!["dana@example.com".to_owned(), "cy@example.com".to_owned()]
     );
+
+    let ada_balance = ctx
+        .select(accounts::account_balance)
+        .from(accounts::table)
+        .where_(accounts::email.eq(bind("ada@example.com")))
+        .fetch_one::<Decimal>(&client)
+        .await?;
+
+    assert_eq!(ada_balance, Decimal::new(1025, 2));
+
+    let active_balance_total = ctx
+        .select(sum(accounts::account_balance))
+        .from(accounts::table)
+        .where_(accounts::active.eq(bind(true)))
+        .fetch_one::<Option<Decimal>>(&client)
+        .await?;
+
+    assert_eq!(active_balance_total, Some(Decimal::new(8050, 2)));
+
+    let inserted_balance = ctx
+        .insert_into(accounts::table)
+        .values((
+            accounts::id.set(bind(5_i64)),
+            accounts::email.set(bind("eve@example.com")),
+            accounts::display_name.set(bind(None::<String>)),
+            accounts::active.set(bind(true)),
+            accounts::signup_rank.set(bind(50_i32)),
+            accounts::account_balance.set(bind(Decimal::new(5050, 2))),
+        ))
+        .returning(accounts::account_balance)
+        .fetch_one::<Decimal>(&client)
+        .await?;
+
+    assert_eq!(inserted_balance, Decimal::new(5050, 2));
 
     let posts_without_body = ctx
         .select((posts::id, posts::body))

@@ -27,20 +27,20 @@ mod users {
     pub const active: Field<bool, NotNull> = Field::new(table, "active");
 }
 
-# async fn example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
-let ctx = Context::new();
+async fn example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
+    let ctx = Context::new();
 
-let rows = ctx
-    .select((users::id, users::email))
-    .from(users::table)
-    .where_(users::active.eq(bind(true)))
-    .order_by(users::id.desc())
-    .limit(20)
-    .fetch_all::<(i64, String)>(client)
-    .await?;
-# let _ = rows;
-# Ok(())
-# }
+    let _rows = ctx
+        .select((users::id, users::email))
+        .from(users::table)
+        .where_(users::active.eq(bind(true)))
+        .order_by(users::id.desc())
+        .limit(20)
+        .fetch_all::<(i64, String)>(client)
+        .await?;
+
+    Ok(())
+}
 ```
 
 for stuff the typed DSL doesn't cover yet, there's raw SQL + separate bind values:
@@ -48,14 +48,14 @@ for stuff the typed DSL doesn't cover yet, there's raw SQL + separate bind value
 ```rust
 use fuwa::prelude::*;
 
-# async fn example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
-let rows = raw(r#"select filename from "ImageMetadata" where filename = any($1)"#)
-    .bind(vec!["a.jpg".to_owned(), "b.jpg".to_owned()])
-    .fetch_all::<String>(client)
-    .await?;
-# let _ = rows;
-# Ok(())
-# }
+async fn raw_example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
+    let _rows = raw(r#"select filename from "ImageMetadata" where filename = any($1)"#)
+        .bind(vec!["a.jpg".to_owned(), "b.jpg".to_owned()])
+        .fetch_all::<String>(client)
+        .await?;
+
+    Ok(())
+}
 ```
 
 ## codegen

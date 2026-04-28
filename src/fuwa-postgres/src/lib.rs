@@ -66,6 +66,7 @@ impl_scalar_from_row!(
     chrono::NaiveDate,
     chrono::NaiveDateTime,
     chrono::DateTime<chrono::Utc>,
+    rust_decimal::Decimal,
     serde_json::Value,
 );
 

@@ -2,6 +2,7 @@ use std::fmt;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use postgres_types::ToSql;
+use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::{Expr, ExprNode, NotNull, Nullable};
@@ -67,6 +68,7 @@ impl_bind_scalar!(
     NaiveDate,
     NaiveDateTime,
     DateTime<Utc>,
+    Decimal,
     serde_json::Value,
 );
 

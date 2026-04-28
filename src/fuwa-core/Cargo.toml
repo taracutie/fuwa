@@ -10,7 +10,7 @@ description = "Core typed SQL AST and PostgreSQL renderer for fuwa"
 [dependencies]
 chrono.workspace = true
 postgres-types.workspace = true
+rust_decimal.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-

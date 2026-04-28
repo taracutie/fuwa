@@ -9,6 +9,7 @@ pub use fuwa_postgres::{FromRow, PgFuture, PgQueryExt};
 /// Re-exported external types used by generated schema modules.
 pub mod types {
     pub use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+    pub use rust_decimal::Decimal;
     pub use serde_json::Value;
     pub use uuid::Uuid;
 }

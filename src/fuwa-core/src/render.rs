@@ -420,6 +420,7 @@ mod tests {
         pub const id: Field<i64, NotNull> = Field::new(table, "id");
         pub const email: Field<String, NotNull> = Field::new(table, "email");
         pub const active: Field<bool, NotNull> = Field::new(table, "active");
+        pub const signup_rank: Field<i32, NotNull> = Field::new(table, "signup_rank");
         pub const created_at: Field<i64, NotNull> = Field::new(table, "created_at");
         pub const profile: Field<serde_json::Value, Nullable> = Field::new(table, "profile");
     }
@@ -612,5 +613,24 @@ mod tests {
             )
         );
         assert_eq!(query.binds().len(), 3);
+    }
+
+    #[test]
+    fn sum_uses_postgres_output_types() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<i64, Nullable>(sum(users::signup_rank));
+        assert_expr_type::<rust_decimal::Decimal, Nullable>(sum(users::created_at));
+
+        let query = Context::new()
+            .select(sum(users::signup_rank))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            r#"select sum("users"."signup_rank") from "public"."users""#
+        );
     }
 }

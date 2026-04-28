@@ -9,12 +9,12 @@ description = "Public facade crate for the fuwa typed PostgreSQL DSL"
 
 [dependencies]
 chrono.workspace = true
-fuwa-core = { path = "../fuwa-core" }
-fuwa-postgres = { path = "../fuwa-postgres" }
+fuwa-core = { version = "0.1.0", path = "../fuwa-core" }
+fuwa-postgres = { version = "0.1.0", path = "../fuwa-postgres" }
+rust_decimal.workspace = true
 serde_json.workspace = true
 tokio-postgres.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-

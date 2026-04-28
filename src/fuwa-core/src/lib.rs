@@ -17,7 +17,7 @@ pub use bind::{bind, BindParam, BindValue, IntoBindValue};
 pub use error::{Error, Result};
 pub use expr::{
     count, count_star, jsonb_array_length, not, nullable, sum, BinaryOp, Condition, Expr, ExprNode,
-    FieldRef, IntoExpr, OrderDirection, OrderExpr, UnaryOp,
+    FieldRef, IntoExpr, OrderDirection, OrderExpr, SumOutput, UnaryOp,
 };
 pub use ident::quote_ident;
 pub use query::{
@@ -35,6 +35,6 @@ pub mod prelude {
         bind, count, count_star, jsonb_array_length, not, nullable, raw, selection_as, sum,
         Assignment, Assignments, Condition, Context, DeleteQuery, Error, Expr, Field, InsertQuery,
         IntoExpr, NotNull, Nullable, OrderByList, OrderDirection, OrderExpr, RawQuery, RenderQuery,
-        RenderedQuery, Result, SelectQuery, Selectable, Table, UpdateQuery,
+        RenderedQuery, Result, SelectQuery, Selectable, SumOutput, Table, UpdateQuery,
     };
 }

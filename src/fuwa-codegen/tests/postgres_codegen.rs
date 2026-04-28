@@ -33,7 +33,9 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
                 email text not null unique,
                 display_name text,
                 active boolean not null default true,
-                profile jsonb not null default '{}'::jsonb
+                profile jsonb not null default '{}'::jsonb,
+                balance numeric not null default 0,
+                balance_history numeric[] not null default '{}'::numeric[]
             );
 
             create table fuwa_codegen_it.posts (
@@ -63,10 +65,10 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
             );
 
             insert into fuwa_codegen_it.users
-                (id, email, display_name, active, profile)
+                (id, email, display_name, active, profile, balance, balance_history)
             values
-                (1, 'ada@example.com', 'Ada', true, '{"role":"admin"}'::jsonb),
-                (2, 'ben@example.com', null, false, '{"role":"writer"}'::jsonb);
+                (1, 'ada@example.com', 'Ada', true, '{"role":"admin"}'::jsonb, 10.25, array[10.25, 11.50]::numeric[]),
+                (2, 'ben@example.com', null, false, '{"role":"writer"}'::jsonb, 20.50, array[20.50]::numeric[]);
 
             insert into fuwa_codegen_it.posts
                 (id, user_id, title, published_at, created_on)
@@ -113,7 +115,7 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
         .find(|table| table.name == "users")
         .expect("users table should be introspected");
     assert_eq!(users.schema, "fuwa_codegen_it");
-    assert_eq!(users.columns.len(), 5);
+    assert_eq!(users.columns.len(), 7);
 
     let id = users
         .columns
@@ -141,6 +143,25 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
     assert_eq!(profile.pg_type, "jsonb");
     assert_eq!(profile.rust_type.path(), "fuwa::types::Value");
     assert!(profile.default_expression.is_some());
+
+    let balance = users
+        .columns
+        .iter()
+        .find(|column| column.name == "balance")
+        .expect("balance column should be introspected");
+    assert_eq!(balance.pg_type, "numeric");
+    assert_eq!(balance.rust_type.path(), "fuwa::types::Decimal");
+
+    let balance_history = users
+        .columns
+        .iter()
+        .find(|column| column.name == "balance_history")
+        .expect("balance_history column should be introspected");
+    assert_eq!(balance_history.pg_type, "_numeric");
+    assert_eq!(
+        balance_history.rust_type.path(),
+        "Vec<fuwa::types::Decimal>"
+    );
 
     let posts = schema
         .tables
@@ -204,6 +225,12 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
     assert!(generated.contains("pub mod swipe_recent_buffer"));
     assert!(generated.contains("pub mod user_image_preference"));
     assert!(generated.contains("pub const profile: Field<fuwa::types::Value, NotNull>"));
+    assert!(generated.contains("pub const balance: Field<fuwa::types::Decimal, NotNull>"));
+    assert!(
+        generated.contains("pub const balance_history: Field<Vec<fuwa::types::Decimal>, NotNull>")
+    );
+    assert!(generated.contains("pub balance: fuwa::types::Decimal"));
+    assert!(generated.contains("pub balance_history: Vec<fuwa::types::Decimal>"));
     assert!(generated.contains("pub published_at: Option<fuwa::types::NaiveDateTime>"));
     assert!(generated.contains("pub const user_id: Field<String, NotNull>"));
     assert!(generated
