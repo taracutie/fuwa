@@ -1,0 +1,616 @@
+use postgres_types::ToSql;
+
+use crate::{
+    quote_ident, Assignment, BinaryOp, BindValue, DeleteQuery, Error, ExprNode, FieldRef,
+    InsertQuery, Join, JoinKind, OrderDirection, OrderExpr, Result, SelectItem, SelectQuery, Table,
+    UnaryOp, UpdateQuery,
+};
+
+/// A rendered SQL statement plus owned bind values.
+#[derive(Debug)]
+pub struct RenderedQuery {
+    sql: String,
+    binds: Vec<BindValue>,
+}
+
+impl RenderedQuery {
+    pub fn new(sql: String, binds: Vec<BindValue>) -> Self {
+        Self { sql, binds }
+    }
+
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    pub fn binds(&self) -> &[BindValue] {
+        &self.binds
+    }
+
+    /// Borrow bind values in the shape expected by `tokio-postgres`.
+    pub fn bind_refs(&self) -> Vec<&(dyn ToSql + Sync)> {
+        self.binds
+            .iter()
+            .map(|bind| &**bind as &(dyn ToSql + Sync))
+            .collect()
+    }
+}
+
+/// Something that can render itself into PostgreSQL SQL and binds.
+pub trait RenderQuery {
+    fn render(self) -> Result<RenderedQuery>;
+}
+
+#[derive(Default)]
+struct Renderer {
+    sql: String,
+    binds: Vec<BindValue>,
+}
+
+impl Renderer {
+    fn finish(self) -> RenderedQuery {
+        RenderedQuery::new(self.sql, self.binds)
+    }
+
+    fn push_bind(&mut self, value: BindValue) {
+        self.binds.push(value);
+        self.sql.push('$');
+        self.sql.push_str(&self.binds.len().to_string());
+    }
+
+    fn push_i64_bind(&mut self, value: i64) {
+        self.push_bind(Box::new(value));
+    }
+}
+
+impl<R> RenderQuery for SelectQuery<R> {
+    fn render(self) -> Result<RenderedQuery> {
+        let mut renderer = Renderer::default();
+        render_select(self, &mut renderer)?;
+        Ok(renderer.finish())
+    }
+}
+
+impl<R> RenderQuery for InsertQuery<R> {
+    fn render(self) -> Result<RenderedQuery> {
+        let mut renderer = Renderer::default();
+        render_insert(self, &mut renderer)?;
+        Ok(renderer.finish())
+    }
+}
+
+impl<R> RenderQuery for UpdateQuery<R> {
+    fn render(self) -> Result<RenderedQuery> {
+        let mut renderer = Renderer::default();
+        render_update(self, &mut renderer)?;
+        Ok(renderer.finish())
+    }
+}
+
+impl<R> RenderQuery for DeleteQuery<R> {
+    fn render(self) -> Result<RenderedQuery> {
+        let mut renderer = Renderer::default();
+        render_delete(self, &mut renderer)?;
+        Ok(renderer.finish())
+    }
+}
+
+fn render_select<R>(query: SelectQuery<R>, renderer: &mut Renderer) -> Result<()> {
+    if query.selection.is_empty() {
+        return Err(Error::invalid_query_shape(
+            "SELECT requires at least one item",
+        ));
+    }
+    let from = query
+        .from
+        .ok_or_else(|| Error::invalid_query_shape("SELECT requires a FROM table"))?;
+
+    renderer.sql.push_str("select ");
+    render_select_items(query.selection, renderer, FieldQualification::Qualified)?;
+    renderer.sql.push_str(" from ");
+    render_table(from, renderer)?;
+
+    for join in query.joins {
+        render_join(join, renderer)?;
+    }
+
+    if let Some(condition) = query.where_clause {
+        renderer.sql.push_str(" where ");
+        render_expr(
+            condition.into_node(),
+            renderer,
+            FieldQualification::Qualified,
+        )?;
+    }
+
+    if !query.order_by.is_empty() {
+        renderer.sql.push_str(" order by ");
+        render_order_by(query.order_by, renderer)?;
+    }
+
+    if let Some(limit) = query.limit {
+        if limit < 0 {
+            return Err(Error::invalid_query_shape("LIMIT cannot be negative"));
+        }
+        renderer.sql.push_str(" limit ");
+        renderer.push_i64_bind(limit);
+    }
+
+    if let Some(offset) = query.offset {
+        if offset < 0 {
+            return Err(Error::invalid_query_shape("OFFSET cannot be negative"));
+        }
+        renderer.sql.push_str(" offset ");
+        renderer.push_i64_bind(offset);
+    }
+
+    Ok(())
+}
+
+fn render_insert<R>(query: InsertQuery<R>, renderer: &mut Renderer) -> Result<()> {
+    if query.assignments.is_empty() {
+        return Err(Error::invalid_query_shape(
+            "INSERT requires at least one value",
+        ));
+    }
+    validate_assignments_target(query.table, &query.assignments)?;
+
+    renderer.sql.push_str("insert into ");
+    render_table(query.table, renderer)?;
+    renderer.sql.push_str(" (");
+    for (index, assignment) in query.assignments.iter().enumerate() {
+        if index > 0 {
+            renderer.sql.push_str(", ");
+        }
+        renderer
+            .sql
+            .push_str(&quote_ident(assignment.field.name())?);
+    }
+    renderer.sql.push_str(") values (");
+    for (index, assignment) in query.assignments.into_iter().enumerate() {
+        if index > 0 {
+            renderer.sql.push_str(", ");
+        }
+        render_expr(assignment.value, renderer, FieldQualification::Qualified)?;
+    }
+    renderer.sql.push(')');
+
+    if !query.returning.is_empty() {
+        renderer.sql.push_str(" returning ");
+        render_select_items(query.returning, renderer, FieldQualification::Unqualified)?;
+    }
+
+    Ok(())
+}
+
+fn render_update<R>(query: UpdateQuery<R>, renderer: &mut Renderer) -> Result<()> {
+    if query.assignments.is_empty() {
+        return Err(Error::invalid_query_shape(
+            "UPDATE requires at least one assignment",
+        ));
+    }
+    validate_assignments_target(query.table, &query.assignments)?;
+
+    renderer.sql.push_str("update ");
+    render_table(query.table, renderer)?;
+    renderer.sql.push_str(" set ");
+    for (index, assignment) in query.assignments.into_iter().enumerate() {
+        if index > 0 {
+            renderer.sql.push_str(", ");
+        }
+        renderer
+            .sql
+            .push_str(&quote_ident(assignment.field.name())?);
+        renderer.sql.push_str(" = ");
+        render_expr(assignment.value, renderer, FieldQualification::Qualified)?;
+    }
+
+    if let Some(condition) = query.where_clause {
+        renderer.sql.push_str(" where ");
+        render_expr(
+            condition.into_node(),
+            renderer,
+            FieldQualification::Qualified,
+        )?;
+    }
+
+    if !query.returning.is_empty() {
+        renderer.sql.push_str(" returning ");
+        render_select_items(query.returning, renderer, FieldQualification::Unqualified)?;
+    }
+
+    Ok(())
+}
+
+fn render_delete<R>(query: DeleteQuery<R>, renderer: &mut Renderer) -> Result<()> {
+    renderer.sql.push_str("delete from ");
+    render_table(query.table, renderer)?;
+
+    if let Some(condition) = query.where_clause {
+        renderer.sql.push_str(" where ");
+        render_expr(
+            condition.into_node(),
+            renderer,
+            FieldQualification::Qualified,
+        )?;
+    }
+
+    if !query.returning.is_empty() {
+        renderer.sql.push_str(" returning ");
+        render_select_items(query.returning, renderer, FieldQualification::Unqualified)?;
+    }
+
+    Ok(())
+}
+
+fn validate_assignments_target(table: Table, assignments: &[Assignment]) -> Result<()> {
+    for assignment in assignments {
+        if !assignment.field.table().same_identity(table) {
+            return Err(Error::invalid_query_shape(format!(
+                "assignment field {} does not belong to target table {}",
+                assignment.field.name(),
+                table.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn render_select_items(
+    items: Vec<SelectItem>,
+    renderer: &mut Renderer,
+    qualification: FieldQualification,
+) -> Result<()> {
+    for (index, item) in items.into_iter().enumerate() {
+        if index > 0 {
+            renderer.sql.push_str(", ");
+        }
+        render_expr(item.expr, renderer, qualification)?;
+    }
+    Ok(())
+}
+
+fn render_join(join: Join, renderer: &mut Renderer) -> Result<()> {
+    renderer.sql.push(' ');
+    match join.kind {
+        JoinKind::Inner => renderer.sql.push_str("join "),
+        JoinKind::Left => renderer.sql.push_str("left join "),
+    }
+    render_table(join.table, renderer)?;
+    renderer.sql.push_str(" on ");
+    render_expr(join.on.into_node(), renderer, FieldQualification::Qualified)
+}
+
+fn render_order_by(order_by: Vec<OrderExpr>, renderer: &mut Renderer) -> Result<()> {
+    for (index, order) in order_by.into_iter().enumerate() {
+        if index > 0 {
+            renderer.sql.push_str(", ");
+        }
+        render_expr(order.expr, renderer, FieldQualification::Qualified)?;
+        renderer.sql.push(' ');
+        renderer.sql.push_str(match order.direction {
+            OrderDirection::Asc => "asc",
+            OrderDirection::Desc => "desc",
+        });
+    }
+    Ok(())
+}
+
+fn render_table(table: Table, renderer: &mut Renderer) -> Result<()> {
+    if let Some(schema) = table.schema() {
+        renderer.sql.push_str(&quote_ident(schema)?);
+        renderer.sql.push('.');
+    }
+    renderer.sql.push_str(&quote_ident(table.name())?);
+
+    if let Some(alias) = table.alias() {
+        renderer.sql.push_str(" as ");
+        renderer.sql.push_str(&quote_ident(alias)?);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FieldQualification {
+    Qualified,
+    Unqualified,
+}
+
+fn render_field_ref(
+    field: FieldRef,
+    renderer: &mut Renderer,
+    qualification: FieldQualification,
+) -> Result<()> {
+    if matches!(qualification, FieldQualification::Qualified) {
+        let qualifier = field
+            .table()
+            .alias()
+            .unwrap_or_else(|| field.table().name());
+        renderer.sql.push_str(&quote_ident(qualifier)?);
+        renderer.sql.push('.');
+    }
+    renderer.sql.push_str(&quote_ident(field.name())?);
+    Ok(())
+}
+
+fn render_expr(
+    expr: ExprNode,
+    renderer: &mut Renderer,
+    qualification: FieldQualification,
+) -> Result<()> {
+    match expr {
+        ExprNode::Field(field) => render_field_ref(field, renderer, qualification),
+        ExprNode::Bind(bind) => {
+            renderer.push_bind(bind.into_value());
+            Ok(())
+        }
+        ExprNode::Binary { op, left, right } => {
+            renderer.sql.push('(');
+            render_expr(*left, renderer, qualification)?;
+            renderer.sql.push(' ');
+            renderer.sql.push_str(binary_op_sql(op));
+            renderer.sql.push(' ');
+            render_expr(*right, renderer, qualification)?;
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::Unary { op, expr } => {
+            renderer.sql.push('(');
+            renderer.sql.push_str(match op {
+                UnaryOp::Not => "not ",
+            });
+            render_expr(*expr, renderer, qualification)?;
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::IsNull { expr, negated } => {
+            renderer.sql.push('(');
+            render_expr(*expr, renderer, qualification)?;
+            if negated {
+                renderer.sql.push_str(" is not null");
+            } else {
+                renderer.sql.push_str(" is null");
+            }
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::Function { name, args } => {
+            renderer.sql.push_str(name);
+            renderer.sql.push('(');
+            for (index, arg) in args.into_iter().enumerate() {
+                if index > 0 {
+                    renderer.sql.push_str(", ");
+                }
+                render_expr(arg, renderer, qualification)?;
+            }
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::Star => {
+            renderer.sql.push('*');
+            Ok(())
+        }
+    }
+}
+
+fn binary_op_sql(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Eq => "=",
+        BinaryOp::Ne => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::Lte => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::Gte => ">=",
+        BinaryOp::And => "and",
+        BinaryOp::Or => "or",
+        BinaryOp::Like => "like",
+        BinaryOp::ILike => "ilike",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::prelude::*;
+
+    #[allow(non_upper_case_globals)]
+    mod users {
+        use crate::prelude::*;
+
+        pub const table: Table = Table::new("public", "users");
+        pub const id: Field<i64, NotNull> = Field::new(table, "id");
+        pub const email: Field<String, NotNull> = Field::new(table, "email");
+        pub const active: Field<bool, NotNull> = Field::new(table, "active");
+        pub const created_at: Field<i64, NotNull> = Field::new(table, "created_at");
+        pub const profile: Field<serde_json::Value, Nullable> = Field::new(table, "profile");
+    }
+
+    #[allow(non_upper_case_globals)]
+    mod posts {
+        use crate::prelude::*;
+
+        pub const table: Table = Table::new("blog", "posts");
+        pub const id: Field<i64, NotNull> = Field::new(table, "id");
+        pub const user_id: Field<i64, NotNull> = Field::new(table, "user_id");
+        pub const title: Field<String, NotNull> = Field::new(table, "title");
+    }
+
+    #[test]
+    fn renders_basic_select() {
+        let query = Context::new()
+            .select((users::id, users::email))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            r#"select "users"."id", "users"."email" from "public"."users""#
+        );
+        assert_eq!(query.binds().len(), 0);
+    }
+
+    #[test]
+    fn renders_where_and_order_limit_offset() {
+        let query = Context::new()
+            .select((users::id, users::email))
+            .from(users::table)
+            .where_(
+                users::active
+                    .eq(bind(true))
+                    .and(users::email.ilike(bind("%@example.com"))),
+            )
+            .order_by(users::created_at.desc())
+            .limit(20)
+            .offset(40)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id", "users"."email" from "public"."users" "#,
+                r#"where (("users"."active" = $1) and ("users"."email" ilike $2)) "#,
+                r#"order by "users"."created_at" desc limit $3 offset $4"#
+            )
+        );
+        assert_eq!(query.binds().len(), 4);
+    }
+
+    #[test]
+    fn renders_jsonb_array_length_predicate() {
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(
+                users::profile
+                    .is_not_null()
+                    .and(jsonb_array_length(users::profile).gt(bind(1_i32))),
+            )
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id" from "public"."users" "#,
+                r#"where (("users"."profile" is not null) and "#,
+                r#"(jsonb_array_length("users"."profile") > $1))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn renders_join() {
+        let query = Context::new()
+            .select((users::id, posts::title))
+            .from(users::table)
+            .join(posts::table.on(posts::user_id.eq(users::id)))
+            .where_(posts::id.gt(bind(10_i64)))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id", "posts"."title" from "public"."users" "#,
+                r#"join "blog"."posts" on ("posts"."user_id" = "users"."id") "#,
+                r#"where ("posts"."id" > $1)"#
+            )
+        );
+    }
+
+    #[test]
+    fn renders_left_join_with_explicit_nullable_selection() {
+        let query = Context::new()
+            .select((users::id, nullable(posts::title)))
+            .from(users::table)
+            .left_join(posts::table.on(posts::user_id.eq(users::id)))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id", "posts"."title" from "public"."users" "#,
+                r#"left join "blog"."posts" on ("posts"."user_id" = "users"."id")"#
+            )
+        );
+    }
+
+    #[test]
+    fn renders_insert_returning() {
+        let query = Context::new()
+            .insert_into(users::table)
+            .values((
+                users::email.set(bind("a@example.com")),
+                users::active.set(bind(true)),
+            ))
+            .returning(users::id)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"insert into "public"."users" ("email", "active") values ($1, $2) "#,
+                r#"returning "id""#
+            )
+        );
+        assert_eq!(query.binds().len(), 2);
+    }
+
+    #[test]
+    fn renders_update_returning() {
+        let query = Context::new()
+            .update(users::table)
+            .set(users::email.set(bind("new@example.com")))
+            .where_(users::id.eq(bind(7_i64)))
+            .returning((users::id, users::email))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"update "public"."users" set "email" = $1 "#,
+                r#"where ("users"."id" = $2) returning "id", "email""#
+            )
+        );
+    }
+
+    #[test]
+    fn renders_delete_returning() {
+        let query = Context::new()
+            .delete_from(users::table)
+            .where_(users::id.eq(bind(7_i64)))
+            .returning(users::id)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            r#"delete from "public"."users" where ("users"."id" = $1) returning "id""#
+        );
+    }
+
+    #[test]
+    fn bind_numbering_is_left_to_right() {
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::id.gt(bind(1_i64)).and(users::id.lt(bind(10_i64))))
+            .limit(5)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id" from "public"."users" "#,
+                r#"where (("users"."id" > $1) and ("users"."id" < $2)) limit $3"#
+            )
+        );
+        assert_eq!(query.binds().len(), 3);
+    }
+}
