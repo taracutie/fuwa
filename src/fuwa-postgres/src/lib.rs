@@ -3,11 +3,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use fuwa_core::{Error, RenderQuery, Result};
+use fuwa_core::RenderQuery;
+pub use tokio_postgres::types;
 use tokio_postgres::types::FromSqlOwned;
 pub use tokio_postgres::Row;
 use tokio_postgres::{GenericClient, Row as PgRow, Transaction};
 
+pub use fuwa_core::{Error, Result};
 /// Boxed future returned by `fuwa-postgres` extension methods.
 pub type PgFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
@@ -75,13 +77,6 @@ macro_rules! impl_scalar_from_row {
                     decode_column(row, 0)
                 }
             }
-
-            impl FromRow for Option<$ty> {
-                fn from_row(row: &PgRow) -> Result<Self> {
-                    ensure_width(row, 1)?;
-                    decode_column(row, 0)
-                }
-            }
         )+
     };
 }
@@ -102,9 +97,9 @@ impl_scalar_from_row!(
     serde_json::Value,
 );
 
-impl<T> FromRow for Vec<T>
+impl<T> FromRow for Option<T>
 where
-    Vec<T>: FromSqlOwned,
+    Option<T>: FromSqlOwned,
 {
     fn from_row(row: &PgRow) -> Result<Self> {
         ensure_width(row, 1)?;
@@ -112,9 +107,9 @@ where
     }
 }
 
-impl<T> FromRow for Option<Vec<T>>
+impl<T> FromRow for Vec<T>
 where
-    Option<Vec<T>>: FromSqlOwned,
+    Vec<T>: FromSqlOwned,
 {
     fn from_row(row: &PgRow) -> Result<Self> {
         ensure_width(row, 1)?;

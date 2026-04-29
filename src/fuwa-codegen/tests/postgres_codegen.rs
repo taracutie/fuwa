@@ -43,7 +43,15 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
                 user_id bigint not null references fuwa_codegen_it.users(id),
                 title varchar(100) not null,
                 published_at timestamp,
-                created_on date not null default current_date
+                created_on date not null default current_date,
+                constraint posts_user_title_key unique (user_id, title)
+            );
+
+            create table fuwa_codegen_it.out_of_order_pk (
+                a bigint not null,
+                b bigint not null,
+                payload text,
+                primary key (b, a)
             );
 
             create table fuwa_codegen_it."RecentImagePair" (
@@ -107,7 +115,7 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
     );
 
     let schema = introspect_schema_read_only(&read_only_client, "fuwa_codegen_it").await?;
-    assert_eq!(schema.tables.len(), 5);
+    assert_eq!(schema.tables.len(), 6);
 
     let users = schema
         .tables
@@ -168,6 +176,13 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
         .iter()
         .find(|table| table.name == "posts")
         .expect("posts table should be introspected");
+    assert!(
+        posts
+            .uniques
+            .contains(&vec!["user_id".to_owned(), "title".to_owned()]),
+        "posts unique constraints should include compound user_id/title constraint: {:?}",
+        posts.uniques
+    );
     let published_at = posts
         .columns
         .iter()
@@ -176,6 +191,13 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
     assert_eq!(published_at.pg_type, "timestamp");
     assert_eq!(published_at.rust_type.path(), "fuwa::types::NaiveDateTime");
     assert!(published_at.nullable);
+
+    let out_of_order_pk = schema
+        .tables
+        .iter()
+        .find(|table| table.name == "out_of_order_pk")
+        .expect("out_of_order_pk table should be introspected");
+    assert_eq!(out_of_order_pk.primary_key, vec!["b", "a"]);
 
     let recent_pair = schema
         .tables

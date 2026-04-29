@@ -16,4 +16,5 @@ tokio-postgres.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+fuwa-derive = { version = "0.1.0", path = "../fuwa-derive" }
 tokio.workspace = true

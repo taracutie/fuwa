@@ -10,8 +10,146 @@
 
 ---
 
-`fuwa`'s just my cute crate to interact with postgres in a safe + performant
-(hopefully) manner.
+`fuwa`'s just my cute crate to interact with postgres in a safe + performant manner.
+
+## examples
+
+with the `fuwa` DSL, queries read almost the same as the SQL they compile to ~
+typed columns, typed bindings, no string concatenation.
+
+### simple select
+
+```sql
+select id, email
+from users
+where active = true
+order by created_at desc
+limit 20
+```
+
+```rust
+ctx.select((users::id, users::email))
+   .from(users::table)
+   .where_(users::active.eq(bind(true)))
+   .order_by(users::created_at.desc())
+   .limit(20)
+```
+
+### join with multiple conditions
+
+```sql
+select accounts.email, posts.title, posts.score
+from accounts
+join posts on posts.account_id = accounts.id
+where accounts.active = true
+  and posts.published = true
+order by accounts.id asc, posts.id asc
+```
+
+```rust
+ctx.select((accounts::email, posts::title, posts::score))
+   .from(accounts::table)
+   .join(posts::table.on(posts::account_id.eq(accounts::id)))
+   .where_(
+       accounts::active.eq(bind(true))
+           .and(posts::published.eq(bind(true))),
+   )
+   .order_by((accounts::id.asc(), posts::id.asc()))
+```
+
+### aggregation, group by, having
+
+```sql
+select account_id, count(*)
+from posts
+group by account_id
+having count(*) > 1
+order by account_id asc
+```
+
+```rust
+ctx.select((posts::account_id, count_star()))
+   .from(posts::table)
+   .group_by(posts::account_id)
+   .having(count_star().gt(bind(1_i64)))
+   .order_by(posts::account_id.asc())
+```
+
+### case / coalesce / concat
+
+```sql
+select
+    id,
+    coalesce(display_name, email) || ' account',
+    case when active = true then 'active' else 'inactive' end
+from accounts
+where id in (1, 2)
+order by id asc
+```
+
+```rust
+ctx.select((
+       accounts::id,
+       concat(
+           coalesce((accounts::display_name, accounts::email)),
+           bind(" account"),
+       ),
+       case_when()
+           .when(accounts::active.eq(bind(true)), bind("active"))
+           .else_(bind("inactive")),
+   ))
+   .from(accounts::table)
+   .where_(accounts::id.in_([bind(1_i64), bind(2_i64)]))
+   .order_by(accounts::id.asc())
+```
+
+### insert ... returning
+
+```sql
+insert into users (email, active)
+values ('tara@example.com', true)
+returning id
+```
+
+```rust
+ctx.insert_into(users::table)
+   .values((
+       users::email.set(bind("tara@example.com")),
+       users::active.set(bind(true)),
+   ))
+   .returning(users::id)
+```
+
+### upsert (`on conflict do update`)
+
+```sql
+insert into users (id, email, display_name, active)
+values (4, 'ben@example.com', 'Benedict', true)
+on conflict (email) do update
+   set display_name = excluded.display_name,
+       active       = excluded.active
+returning id, display_name, active
+```
+
+```rust
+ctx.insert_into(users::table)
+   .values((
+       users::id.set(bind(4_i64)),
+       users::email.set(bind("ben@example.com")),
+       users::display_name.set(bind(Some("Benedict"))),
+       users::active.set(bind(true)),
+   ))
+   .on_conflict((users::email,))
+   .do_update(|excluded| (
+       users::display_name.set(excluded.field(users::display_name)),
+       users::active.set(excluded.field(users::active)),
+   ))
+   .returning((users::id, users::display_name, users::active))
+```
+
+every column reference + bound value is type-checked at compile time, so a
+typo'd column name or a `bind(true)` against a `text` field is a compile error,
+not a runtime surprise.
 
 ## quickstart
 
@@ -66,6 +204,67 @@ fuwa-codegen \
 `--schema` and `--table` can be repeated or comma-separated. tables can be
 unqualified (`users`) or schema-qualified (`admin.audit_log`). if you skip
 `--table`, it just generates all supported tables in the selected schemas.
+you can also generate from an offline snapshot or a prisma schema:
+
+```sh
+fuwa-codegen --snapshot fuwa.schema.json --out src/schema.rs
+fuwa-codegen --prisma prisma/schema.prisma --out src/schema.rs
+```
+
+to create a snapshot from a live database:
+
+```sh
+fuwa-codegen snapshot \
+  --database-url "$DATABASE_URL" \
+  --schema public \
+  --out fuwa.schema.json
+```
+
+for build scripts, call the library entry point and fall back to a checked-in
+snapshot when `FUWA_OFFLINE=1` or the database is unavailable:
+
+```rust
+// build.rs
+use std::{env, fs, path::PathBuf};
+
+use fuwa_codegen::{generate, CodegenSource, GenerateOptions, SchemaSnapshot};
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=DATABASE_URL");
+    println!("cargo:rerun-if-env-changed=FUWA_OFFLINE");
+    println!("cargo:rerun-if-changed=fuwa.schema.json");
+
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("schema.rs");
+    let snapshot = PathBuf::from("fuwa.schema.json");
+
+    let generated = if env::var_os("FUWA_OFFLINE").is_some() {
+        generate(GenerateOptions::new(CodegenSource::Snapshot(snapshot))).unwrap()
+    } else {
+        let database_url = env::var("DATABASE_URL").unwrap();
+        generate(GenerateOptions::new(CodegenSource::Database {
+            database_url,
+            schemas: vec!["public".to_owned()],
+            tables: Vec::new(),
+        }))
+        .or_else(|_| {
+            SchemaSnapshot::from_snapshot("fuwa.schema.json")
+                .and_then(|snapshot| generate(GenerateOptions::new(CodegenSource::SnapshotValue(snapshot))))
+        })
+        .unwrap()
+    };
+
+    fs::write(out, generated).unwrap();
+}
+```
+
+add `fuwa-codegen` under `[build-dependencies]` when you use this pattern.
+include the generated output from your crate:
+
+```rust
+pub mod schema {
+    include!(concat!(env!("OUT_DIR"), "/schema.rs"));
+}
+```
 
 generated modules come with `Table` constants, typed `Field<T, Nullability>`
 constants, a `Record` struct, a `FromRow` impl, + an `all()` selection helper:
@@ -245,3 +444,5 @@ FUWA_TEST_DATABASE_URL=postgres://fuwa:fuwa@localhost:15432/fuwa cargo test -p f
 - `fuwa-codegen` connects with `default_transaction_read_only=on` and pokes
   around inside an explicit `BEGIN READ ONLY` transaction (so it cant mess up
   your db on accident).
+- `fuwa-codegen` can read live postgres, `fuwa.schema.json` snapshots, or
+  postgresql `schema.prisma` files.

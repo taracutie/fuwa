@@ -10,6 +10,21 @@ mod users {
     pub const active: Field<bool, NotNull> = Field::new(table, "active");
 }
 
+#[allow(dead_code)]
+mod root_derive_exports {
+    use fuwa::FromRow;
+
+    #[derive(FromRow)]
+    struct ImportedRootDerive {
+        id: i64,
+    }
+
+    #[derive(fuwa::FromRow)]
+    struct QualifiedRootDerive {
+        id: i64,
+    }
+}
+
 #[test]
 fn facade_renders_query() {
     let rendered = Context::new()

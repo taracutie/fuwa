@@ -1,9 +1,19 @@
+extern crate fuwa_postgres as fuwa;
+
 use fuwa_core::prelude::*;
+use fuwa_derive::FromRow;
 use fuwa_postgres::{transaction, PgQueryExt};
 use rust_decimal::Decimal;
 use tokio_postgres::NoTls;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+#[derive(Debug, PartialEq, Eq, FromRow)]
+struct DerivedAccount {
+    id: i64,
+    email: String,
+    display_name: Option<String>,
+}
 
 #[allow(non_upper_case_globals)]
 mod users {
@@ -290,6 +300,62 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
 
     client
         .batch_execute("drop table if exists public.fuwa_test_upsert_users;")
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn derive_from_row_decodes_custom_struct_by_column_name_when_database_url_is_set(
+) -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!("skipping FromRow derive integration test: FUWA_TEST_DATABASE_URL is not set");
+        return Ok(());
+    };
+
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("PostgreSQL connection task failed: {err}");
+        }
+    });
+
+    client
+        .batch_execute(
+            r#"
+            drop table if exists public.fuwa_test_derive_accounts;
+            create table public.fuwa_test_derive_accounts (
+                id bigint primary key,
+                email text not null,
+                display_name text
+            );
+
+            insert into public.fuwa_test_derive_accounts (id, email, display_name)
+            values (1, 'derive@example.com', 'Derived');
+            "#,
+        )
+        .await?;
+
+    let account = raw(r#"
+        select display_name, email, id
+        from public.fuwa_test_derive_accounts
+        where id = $1
+        "#)
+    .bind(1_i64)
+    .fetch_one::<DerivedAccount>(&client)
+    .await?;
+
+    assert_eq!(
+        account,
+        DerivedAccount {
+            id: 1,
+            email: "derive@example.com".to_owned(),
+            display_name: Some("Derived".to_owned()),
+        }
+    );
+
+    client
+        .batch_execute("drop table if exists public.fuwa_test_derive_accounts;")
         .await?;
 
     Ok(())

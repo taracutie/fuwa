@@ -2,6 +2,7 @@
 members = [
     "src/fuwa",
     "src/fuwa-core",
+    "src/fuwa-derive",
     "src/fuwa-postgres",
     "src/fuwa-codegen",
 ]
@@ -21,6 +22,7 @@ prettyplease = "0.2"
 proc-macro2 = "1"
 quote = "1"
 rust_decimal = { version = "1", default-features = false, features = ["db-tokio-postgres"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syn = { version = "2", features = ["full"] }
 thiserror = "2"

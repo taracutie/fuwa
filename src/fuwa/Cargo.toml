@@ -10,6 +10,7 @@ description = "Public facade crate for the fuwa typed PostgreSQL DSL"
 [dependencies]
 chrono.workspace = true
 fuwa-core = { version = "0.1.0", path = "../fuwa-core" }
+fuwa-derive = { version = "0.1.0", path = "../fuwa-derive" }
 fuwa-postgres = { version = "0.1.0", path = "../fuwa-postgres" }
 rust_decimal.workspace = true
 serde_json.workspace = true
