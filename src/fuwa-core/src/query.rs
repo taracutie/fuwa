@@ -292,6 +292,14 @@ impl_tuple_expr_list!(A a, B b, C c, D d, E e);
 impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f);
 impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g);
 impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h, I i);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o);
+impl_tuple_expr_list!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o, P p);
 
 /// SQL join kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +379,14 @@ impl_tuple_assignments!(A a, B b, C c, D d, E e);
 impl_tuple_assignments!(A a, B b, C c, D d, E e, F f);
 impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g);
 impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h);
+impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h, I i);
+impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j);
+impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k);
+impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l);
+impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m);
+impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n);
+impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o);
+impl_tuple_assignments!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o, P p);
 
 /// A field reference that resolves to PostgreSQL's `excluded` pseudo-table.
 #[derive(Debug, Clone, Copy, Default)]
@@ -422,6 +438,14 @@ impl_tuple_conflict_target!(A a, B b, C c, D d, E e);
 impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f);
 impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g);
 impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h, I i);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o);
+impl_tuple_conflict_target!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o, P p);
 
 /// `ON CONFLICT` behavior for an `INSERT`.
 #[derive(Debug)]
@@ -635,6 +659,18 @@ impl_tuple_order_by!(A a);
 impl_tuple_order_by!(A a, B b);
 impl_tuple_order_by!(A a, B b, C c);
 impl_tuple_order_by!(A a, B b, C c, D d);
+impl_tuple_order_by!(A a, B b, C c, D d, E e);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g, H h);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g, H h, I i);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o);
+impl_tuple_order_by!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o, P p);
 
 impl From<OrderDirection> for &'static str {
     fn from(direction: OrderDirection) -> Self {

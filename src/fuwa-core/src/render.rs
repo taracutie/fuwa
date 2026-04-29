@@ -842,6 +842,29 @@ mod tests {
         pub const title: Field<String, NotNull> = Field::new(table, "title");
     }
 
+    #[allow(non_upper_case_globals)]
+    mod wide {
+        use crate::prelude::*;
+
+        pub const table: Table = Table::new("public", "wide");
+        pub const c01: Field<i64, NotNull> = Field::new(table, "c01");
+        pub const c02: Field<i64, NotNull> = Field::new(table, "c02");
+        pub const c03: Field<i64, NotNull> = Field::new(table, "c03");
+        pub const c04: Field<i64, NotNull> = Field::new(table, "c04");
+        pub const c05: Field<i64, NotNull> = Field::new(table, "c05");
+        pub const c06: Field<i64, NotNull> = Field::new(table, "c06");
+        pub const c07: Field<i64, NotNull> = Field::new(table, "c07");
+        pub const c08: Field<i64, NotNull> = Field::new(table, "c08");
+        pub const c09: Field<i64, NotNull> = Field::new(table, "c09");
+        pub const c10: Field<i64, NotNull> = Field::new(table, "c10");
+        pub const c11: Field<i64, NotNull> = Field::new(table, "c11");
+        pub const c12: Field<i64, NotNull> = Field::new(table, "c12");
+        pub const c13: Field<i64, NotNull> = Field::new(table, "c13");
+        pub const c14: Field<i64, NotNull> = Field::new(table, "c14");
+        pub const c15: Field<i64, NotNull> = Field::new(table, "c15");
+        pub const c16: Field<i64, NotNull> = Field::new(table, "c16");
+    }
+
     #[test]
     fn renders_basic_select() {
         let query = Context::new()
@@ -853,6 +876,44 @@ mod tests {
         assert_eq!(
             query.sql(),
             r#"select "users"."id", "users"."email" from "public"."users""#
+        );
+        assert_eq!(query.binds().len(), 0);
+    }
+
+    #[test]
+    fn renders_sixteen_column_select() {
+        let query = Context::new()
+            .select((
+                wide::c01,
+                wide::c02,
+                wide::c03,
+                wide::c04,
+                wide::c05,
+                wide::c06,
+                wide::c07,
+                wide::c08,
+                wide::c09,
+                wide::c10,
+                wide::c11,
+                wide::c12,
+                wide::c13,
+                wide::c14,
+                wide::c15,
+                wide::c16,
+            ))
+            .from(wide::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "wide"."c01", "wide"."c02", "wide"."c03", "wide"."c04", "#,
+                r#""wide"."c05", "wide"."c06", "wide"."c07", "wide"."c08", "#,
+                r#""wide"."c09", "wide"."c10", "wide"."c11", "wide"."c12", "#,
+                r#""wide"."c13", "wide"."c14", "wide"."c15", "wide"."c16" "#,
+                r#"from "public"."wide""#
+            )
         );
         assert_eq!(query.binds().len(), 0);
     }
@@ -1365,6 +1426,45 @@ mod tests {
     }
 
     #[test]
+    fn renders_sixteen_column_conflict_target() {
+        let query = Context::new()
+            .insert_into(wide::table)
+            .values(wide::c01.set(bind(1_i64)))
+            .on_conflict((
+                wide::c01,
+                wide::c02,
+                wide::c03,
+                wide::c04,
+                wide::c05,
+                wide::c06,
+                wide::c07,
+                wide::c08,
+                wide::c09,
+                wide::c10,
+                wide::c11,
+                wide::c12,
+                wide::c13,
+                wide::c14,
+                wide::c15,
+                wide::c16,
+            ))
+            .do_nothing()
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"insert into "public"."wide" ("c01") values ($1) "#,
+                r#"on conflict ("c01", "c02", "c03", "c04", "c05", "c06", "#,
+                r#""c07", "c08", "c09", "c10", "c11", "c12", "c13", "c14", "#,
+                r#""c15", "c16") do nothing"#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
     fn renders_insert_on_conflict_do_update_with_excluded() {
         let query = Context::new()
             .insert_into(users::table)
@@ -1460,6 +1560,44 @@ mod tests {
                 if message.contains("excluded fields")
                     && message.contains("ON CONFLICT DO UPDATE")
         ));
+    }
+
+    #[test]
+    fn renders_sixteen_field_update() {
+        let query = Context::new()
+            .update(wide::table)
+            .set((
+                wide::c01.set(bind(1_i64)),
+                wide::c02.set(bind(2_i64)),
+                wide::c03.set(bind(3_i64)),
+                wide::c04.set(bind(4_i64)),
+                wide::c05.set(bind(5_i64)),
+                wide::c06.set(bind(6_i64)),
+                wide::c07.set(bind(7_i64)),
+                wide::c08.set(bind(8_i64)),
+                wide::c09.set(bind(9_i64)),
+                wide::c10.set(bind(10_i64)),
+                wide::c11.set(bind(11_i64)),
+                wide::c12.set(bind(12_i64)),
+                wide::c13.set(bind(13_i64)),
+                wide::c14.set(bind(14_i64)),
+                wide::c15.set(bind(15_i64)),
+                wide::c16.set(bind(16_i64)),
+            ))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"update "public"."wide" set "c01" = $1, "c02" = $2, "#,
+                r#""c03" = $3, "c04" = $4, "c05" = $5, "c06" = $6, "#,
+                r#""c07" = $7, "c08" = $8, "c09" = $9, "c10" = $10, "#,
+                r#""c11" = $11, "c12" = $12, "c13" = $13, "c14" = $14, "#,
+                r#""c15" = $15, "c16" = $16"#
+            )
+        );
+        assert_eq!(query.binds().len(), 16);
     }
 
     #[test]
@@ -1638,6 +1776,24 @@ mod tests {
         assert_expr_type::<String, Nullable>(concat(users::display_name, users::email));
         assert_expr_type::<String, NotNull>(coalesce((users::display_name, users::email)));
         assert_expr_type::<String, Nullable>(nullif(users::email, bind("")));
+        assert_expr_type::<i64, NotNull>(coalesce((
+            wide::c01,
+            wide::c02,
+            wide::c03,
+            wide::c04,
+            wide::c05,
+            wide::c06,
+            wide::c07,
+            wide::c08,
+            wide::c09,
+            wide::c10,
+            wide::c11,
+            wide::c12,
+            wide::c13,
+            wide::c14,
+            wide::c15,
+            wide::c16,
+        )));
 
         let query = Context::new()
             .select((

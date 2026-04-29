@@ -229,6 +229,14 @@ impl_coalesce_fold!(A, B, C, D);
 impl_coalesce_fold!(A, B, C, D, E);
 impl_coalesce_fold!(A, B, C, D, E, F);
 impl_coalesce_fold!(A, B, C, D, E, F, G);
+impl_coalesce_fold!(A, B, C, D, E, F, G, H);
+impl_coalesce_fold!(A, B, C, D, E, F, G, H, I);
+impl_coalesce_fold!(A, B, C, D, E, F, G, H, I, J);
+impl_coalesce_fold!(A, B, C, D, E, F, G, H, I, J, K);
+impl_coalesce_fold!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_coalesce_fold!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+impl_coalesce_fold!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+impl_coalesce_fold!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
 
 #[doc(hidden)]
 pub trait CoalesceNullabilityList {
@@ -257,6 +265,14 @@ impl_coalesce_nullability_list!(A, B, C, D, E);
 impl_coalesce_nullability_list!(A, B, C, D, E, F);
 impl_coalesce_nullability_list!(A, B, C, D, E, F, G);
 impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H);
+impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I);
+impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I, J);
+impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I, J, K);
+impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
 /// Runtime SQL expression AST.
 #[derive(Debug)]
@@ -1048,6 +1064,14 @@ impl_coalesce_args!(A a, B b, C c, D d, E e);
 impl_coalesce_args!(A a, B b, C c, D d, E e, F f);
 impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g);
 impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g, H h);
+impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g, H h, I i);
+impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j);
+impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k);
+impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l);
+impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m);
+impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n);
+impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o);
+impl_coalesce_args!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o, P p);
 
 /// Concatenate two string expressions with PostgreSQL `||`.
 pub fn concat<A, B>(

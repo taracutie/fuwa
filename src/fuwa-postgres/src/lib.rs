@@ -273,6 +273,14 @@ impl_tuple_from_row!(5, A 0, B 1, C 2, D 3, E 4);
 impl_tuple_from_row!(6, A 0, B 1, C 2, D 3, E 4, F 5);
 impl_tuple_from_row!(7, A 0, B 1, C 2, D 3, E 4, F 5, G 6);
 impl_tuple_from_row!(8, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7);
+impl_tuple_from_row!(9, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8);
+impl_tuple_from_row!(10, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9);
+impl_tuple_from_row!(11, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
+impl_tuple_from_row!(12, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
+impl_tuple_from_row!(13, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12);
+impl_tuple_from_row!(14, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12, N 13);
+impl_tuple_from_row!(15, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12, N 13, O 14);
+impl_tuple_from_row!(16, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12, N 13, O 14, P 15);
 
 struct PortalStreamState<'tx, 'client> {
     transaction: &'tx Transaction<'client>,

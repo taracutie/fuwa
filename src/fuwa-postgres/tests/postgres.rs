@@ -103,6 +103,42 @@ async fn postgres_round_trip_when_database_url_is_set() -> TestResult {
 
     let dsl = Dsl::using(&client);
 
+    let sixteen_column_row = dsl
+        .raw(
+            r#"
+            select
+                1::bigint, 2::bigint, 3::bigint, 4::bigint,
+                5::bigint, 6::bigint, 7::bigint, 8::bigint,
+                9::bigint, 10::bigint, 11::bigint, 12::bigint,
+                13::bigint, 14::bigint, 15::bigint, 16::bigint
+            "#,
+        )
+        .fetch_one::<(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        )>()
+        .await?;
+    let (c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16) =
+        sixteen_column_row;
+    assert_eq!(
+        [c01, c02, c03, c04, c05, c06, c07, c08, c09, c10, c11, c12, c13, c14, c15, c16,],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    );
+
     let inserted_id = dsl
         .insert_into(users::table)
         .values((
