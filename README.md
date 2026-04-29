@@ -30,7 +30,7 @@ limit 20
 ```rust
 ctx.select((users::id, users::email))
    .from(users::table)
-   .where_(users::active.eq(bind(true)))
+   .where_(users::active.eq(true))
    .order_by(users::created_at.desc())
    .limit(20)
 ```
@@ -51,8 +51,8 @@ ctx.select((accounts::email, posts::title, posts::score))
    .from(accounts::table)
    .join(posts::table.on(posts::account_id.eq(accounts::id)))
    .where_(
-       accounts::active.eq(bind(true))
-           .and(posts::published.eq(bind(true))),
+       accounts::active.eq(true)
+           .and(posts::published.eq(true)),
    )
    .order_by((accounts::id.asc(), posts::id.asc()))
 ```
@@ -71,7 +71,7 @@ order by account_id asc
 ctx.select((posts::account_id, count_star()))
    .from(posts::table)
    .group_by(posts::account_id)
-   .having(count_star().gt(bind(1_i64)))
+   .having(count_star().gt(1_i64))
    .order_by(posts::account_id.asc())
 ```
 
@@ -95,11 +95,11 @@ ctx.select((
            bind(" account"),
        ),
        case_when()
-           .when(accounts::active.eq(bind(true)), bind("active"))
+           .when(accounts::active.eq(true), bind("active"))
            .else_(bind("inactive")),
    ))
    .from(accounts::table)
-   .where_(accounts::id.in_([bind(1_i64), bind(2_i64)]))
+   .where_(accounts::id.in_([1_i64, 2_i64]))
    .order_by(accounts::id.asc())
 ```
 
@@ -114,8 +114,8 @@ returning id
 ```rust
 ctx.insert_into(users::table)
    .values((
-       users::email.set(bind("tara@example.com")),
-       users::active.set(bind(true)),
+       users::email.set("tara@example.com"),
+       users::active.set(true),
    ))
    .returning(users::id)
 ```
@@ -134,10 +134,10 @@ returning id, display_name, active
 ```rust
 ctx.insert_into(users::table)
    .values((
-       users::id.set(bind(4_i64)),
-       users::email.set(bind("ben@example.com")),
-       users::display_name.set(bind(Some("Benedict"))),
-       users::active.set(bind(true)),
+       users::id.set(4_i64),
+       users::email.set("ben@example.com"),
+       users::display_name.set(Some("Benedict")),
+       users::active.set(true),
    ))
    .on_conflict((users::email,))
    .do_update(|excluded| (
@@ -148,7 +148,7 @@ ctx.insert_into(users::table)
 ```
 
 every column reference + bound value is type-checked at compile time, so a
-typo'd column name or a `bind(true)` against a `text` field is a compile error,
+typo'd column name or an `.eq(true)` against a `text` field is a compile error,
 not a runtime surprise.
 
 ## quickstart
@@ -305,8 +305,9 @@ use schema::{posts, users};
 
 ### 5. build and execute queries
 
-`Context` is the query builder entry point. values go thru `bind(...)` ~
-they're never just stuffed into the SQL text.
+`Context` is the query builder entry point. plain values passed to comparisons
+and assignments become bind parameters automatically, so they're never just
+stuffed into the SQL text. `bind(...)` still works when you want to be explicit.
 
 ```rust
 let ctx = Context::new();
@@ -315,7 +316,7 @@ let rows = ctx
     .select((users::id, users::email, posts::title))
     .from(users::table)
     .join(posts::table.on(posts::user_id.eq(users::id)))
-    .where_(users::active.eq(bind(true)))
+    .where_(users::active.eq(true))
     .order_by(users::created_at.desc())
     .limit(20)
     .fetch_all::<(i64, String, String)>(&client)
@@ -324,7 +325,7 @@ let rows = ctx
 let users = ctx
     .select(users::all())
     .from(users::table)
-    .where_(users::email.ilike(bind("%@example.com")))
+    .where_(users::email.ilike("%@example.com"))
     .fetch_all::<users::Record>(&client)
     .await?;
 ```
@@ -357,8 +358,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user_id = ctx
         .insert_into(users::table)
         .values((
-            users::email.set(bind("tara@example.com")),
-            users::active.set(bind(true)),
+            users::email.set("tara@example.com"),
+            users::active.set(true),
         ))
         .returning(users::id)
         .fetch_one::<i64>(&client)
@@ -367,9 +368,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let post_id = ctx
         .insert_into(posts::table)
         .values((
-            posts::user_id.set(bind(user_id)),
-            posts::title.set(bind("hello from fuwa")),
-            posts::published.set(bind(true)),
+            posts::user_id.set(user_id),
+            posts::title.set("hello from fuwa"),
+            posts::published.set(true),
         ))
         .returning(posts::id)
         .fetch_one::<i64>(&client)
@@ -379,7 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .select((users::id, users::email, posts::title))
         .from(users::table)
         .join(posts::table.on(posts::user_id.eq(users::id)))
-        .where_(users::active.eq(bind(true)).and(posts::published.eq(bind(true))))
+        .where_(users::active.eq(true).and(posts::published.eq(true)))
         .order_by((users::id.asc(), posts::id.desc()))
         .limit(20)
         .fetch_all::<(i64, String, String)>(&client)
@@ -388,21 +389,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matching_users = ctx
         .select(users::all())
         .from(users::table)
-        .where_(users::email.ilike(bind("%@example.com")))
+        .where_(users::email.ilike("%@example.com"))
         .fetch_all::<users::Record>(&client)
         .await?;
 
     let renamed_email = ctx
         .update(users::table)
-        .set(users::email.set(bind("new@example.com")))
-        .where_(users::id.eq(bind(user_id)))
+        .set(users::email.set("new@example.com"))
+        .where_(users::id.eq(user_id))
         .returning(users::email)
         .fetch_one::<String>(&client)
         .await?;
 
     let deleted_posts = ctx
         .delete_from(posts::table)
-        .where_(posts::id.eq(bind(post_id)))
+        .where_(posts::id.eq(post_id))
         .execute(&client)
         .await?;
 

@@ -646,6 +646,17 @@ impl<T, N> IntoExpr<T> for Field<T, N> {
     }
 }
 
+impl<T, V> IntoExpr<T> for V
+where
+    V: crate::IntoBindValue<Sql = T>,
+{
+    type Nullability = V::Nullability;
+
+    fn into_expr(self) -> Expr<T, Self::Nullability> {
+        crate::bind(self)
+    }
+}
+
 /// A boolean SQL condition.
 #[derive(Debug)]
 pub struct Condition {
