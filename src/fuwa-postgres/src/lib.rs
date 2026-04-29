@@ -2,9 +2,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures_core::Stream;
-use futures_util::{stream, StreamExt};
+use futures_util::stream;
+pub use futures_util::StreamExt;
 use fuwa_core::{
     raw, AliasedSubquery, Assignments, ConflictTarget, Context, DeleteQuery, Excluded, ExprList,
     InOperand, InOperandNode, InsertConflictBuilder, InsertQuery, JoinTarget, OrderByList,
@@ -14,8 +16,9 @@ use fuwa_core::{
 pub use tokio_postgres::types;
 use tokio_postgres::types::FromSqlOwned;
 pub use tokio_postgres::Row;
-use tokio_postgres::{GenericClient, Portal, Row as PgRow, RowStream, Transaction};
+use tokio_postgres::{Client, GenericClient, NoTls, Portal, Row as PgRow, RowStream, Transaction};
 
+pub use deadpool_postgres::Pool;
 pub use fuwa_core::{Error, Result};
 /// Boxed future returned by `fuwa-postgres` extension methods.
 pub type PgFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -27,151 +30,490 @@ pub type PgStream<'a, T> = Pin<Box<dyn Stream<Item = Result<T>> + Send + 'a>>;
 pub type TransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 const DEFAULT_PORTAL_FETCH_ROWS: i32 = 1024;
+const STREAMING_REQUIRES_TRANSACTION: &str =
+    "fetch_stream and fetch_chunked require an existing transaction; wrap the call in dsl.transaction(|dsl| ...)";
 
-/// Entry point for creating a connection-bound DSL context.
+/// Pool construction options for fuwa's default PostgreSQL pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolOptions {
+    pub max_size: usize,
+}
+
+impl Default for PoolOptions {
+    fn default() -> Self {
+        Self { max_size: 16 }
+    }
+}
+
+/// Build fuwa's default PostgreSQL pool from a database URL.
+pub fn create_pool(database_url: impl AsRef<str>) -> Result<Pool> {
+    create_pool_with_options(database_url, PoolOptions::default())
+}
+
+/// Build fuwa's default PostgreSQL pool from a database URL and options.
+pub fn create_pool_with_options(
+    database_url: impl AsRef<str>,
+    options: PoolOptions,
+) -> Result<Pool> {
+    if options.max_size == 0 {
+        return Err(Error::execution("pool max_size must be greater than zero"));
+    }
+
+    let config = database_url
+        .as_ref()
+        .parse::<tokio_postgres::Config>()
+        .map_err(|err| Error::execution(err.to_string()))?;
+    let manager = deadpool_postgres::Manager::from_config(
+        config,
+        NoTls,
+        deadpool_postgres::ManagerConfig {
+            recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+        },
+    );
+
+    Pool::builder(manager)
+        .max_size(options.max_size)
+        .build()
+        .map_err(|err| Error::execution(err.to_string()))
+}
+
+/// Entry point for creating an executor-bound DSL context.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Dsl;
 
 impl Dsl {
-    pub fn using<C>(connection: C) -> DslContext<C>
+    pub fn connect(database_url: impl AsRef<str>) -> Result<DslContext<Pool>> {
+        Self::connect_with_options(database_url, PoolOptions::default())
+    }
+
+    pub fn connect_with_options(
+        database_url: impl AsRef<str>,
+        options: PoolOptions,
+    ) -> Result<DslContext<Pool>> {
+        create_pool_with_options(database_url, options).map(Self::using)
+    }
+
+    pub fn using<E>(executor: E) -> DslContext<E>
     where
-        C: ConnectionRef,
+        E: Executor,
     {
-        DslContext::new(connection)
+        DslContext::new(executor)
+    }
+}
+
+/// A source that can provide a PostgreSQL client when a query executes.
+pub trait Executor: Sync {
+    type Conn<'a>: AcquiredConnection + Send + Sync
+    where
+        Self: 'a;
+
+    fn acquire(&self) -> PgFuture<'_, Self::Conn<'_>>;
+}
+
+#[doc(hidden)]
+pub trait AcquiredConnection {
+    type Client: GenericClient + Sync + ?Sized;
+
+    fn as_client(&self) -> &Self::Client;
+
+    fn as_transaction(&self) -> Option<&Transaction<'_>> {
+        None
     }
 }
 
 #[doc(hidden)]
-pub trait ConnectionRef {
-    type Client: GenericClient + Sync + ?Sized;
-
-    fn as_client(&self) -> &Self::Client;
+pub trait TransactionConnection: AcquiredConnection<Client = Client> {
+    fn as_client_mut(&mut self) -> &mut Client;
 }
 
-impl<C> ConnectionRef for &C
-where
-    C: GenericClient + Sync + ?Sized,
-{
-    type Client = C;
+impl<'client> Executor for &'client Client {
+    type Conn<'a>
+        = &'a Client
+    where
+        Self: 'a;
 
-    fn as_client(&self) -> &Self::Client {
-        *self
+    fn acquire(&self) -> PgFuture<'_, Self::Conn<'_>> {
+        Box::pin(async move { Ok(*self) })
     }
 }
 
-impl<C> ConnectionRef for &mut C
-where
-    C: GenericClient + Sync + ?Sized,
-{
-    type Client = C;
+impl<'client> AcquiredConnection for &'client Client {
+    type Client = Client;
 
     fn as_client(&self) -> &Self::Client {
-        &**self
+        self
     }
 }
 
-/// A jOOQ-style, connection-bound DSL context.
-pub struct DslContext<C> {
-    connection: C,
+impl<'client> Executor for &'client mut Client {
+    type Conn<'a>
+        = &'a Client
+    where
+        Self: 'a;
+
+    fn acquire(&self) -> PgFuture<'_, Self::Conn<'_>> {
+        Box::pin(async move { Ok(&**self) })
+    }
+}
+
+impl<'transaction, 'client> Executor for &'transaction Transaction<'client>
+where
+    'client: 'transaction,
+{
+    type Conn<'a>
+        = &'a Transaction<'client>
+    where
+        Self: 'a;
+
+    fn acquire(&self) -> PgFuture<'_, Self::Conn<'_>> {
+        Box::pin(async move { Ok(*self) })
+    }
+}
+
+impl<'transaction, 'client> Executor for &'transaction mut Transaction<'client>
+where
+    'client: 'transaction,
+{
+    type Conn<'a>
+        = &'a Transaction<'client>
+    where
+        Self: 'a;
+
+    fn acquire(&self) -> PgFuture<'_, Self::Conn<'_>> {
+        Box::pin(async move { Ok(&**self) })
+    }
+}
+
+impl<'transaction, 'client> AcquiredConnection for &'transaction Transaction<'client>
+where
+    'client: 'transaction,
+{
+    type Client = Transaction<'client>;
+
+    fn as_client(&self) -> &Self::Client {
+        self
+    }
+
+    fn as_transaction(&self) -> Option<&Transaction<'_>> {
+        Some(*self)
+    }
+}
+
+impl<E> Executor for Arc<E>
+where
+    E: Executor + Send,
+{
+    type Conn<'a>
+        = E::Conn<'a>
+    where
+        Self: 'a;
+
+    fn acquire(&self) -> PgFuture<'_, Self::Conn<'_>> {
+        self.as_ref().acquire()
+    }
+}
+
+impl Executor for Pool {
+    type Conn<'a>
+        = deadpool_postgres::Client
+    where
+        Self: 'a;
+
+    fn acquire(&self) -> PgFuture<'_, Self::Conn<'_>> {
+        Box::pin(async move {
+            self.get()
+                .await
+                .map_err(|err| Error::execution(err.to_string()))
+        })
+    }
+}
+
+impl AcquiredConnection for deadpool_postgres::Client {
+    type Client = Client;
+
+    fn as_client(&self) -> &Self::Client {
+        &***self
+    }
+}
+
+impl TransactionConnection for deadpool_postgres::Client {
+    fn as_client_mut(&mut self) -> &mut Client {
+        &mut ***self
+    }
+}
+
+impl<M> Executor for bb8::Pool<M>
+where
+    M: bb8::ManageConnection<Connection = Client> + Sync,
+    M::Error: std::fmt::Debug + Send + Sync + 'static,
+    for<'a> bb8::PooledConnection<'a, M>: Send + Sync,
+{
+    type Conn<'a>
+        = bb8::PooledConnection<'a, M>
+    where
+        Self: 'a;
+
+    fn acquire(&self) -> PgFuture<'_, Self::Conn<'_>> {
+        Box::pin(async move {
+            self.get()
+                .await
+                .map_err(|err| Error::execution(format!("{err:?}")))
+        })
+    }
+}
+
+impl<'pool, M> AcquiredConnection for bb8::PooledConnection<'pool, M>
+where
+    M: bb8::ManageConnection<Connection = Client>,
+{
+    type Client = Client;
+
+    fn as_client(&self) -> &Self::Client {
+        self
+    }
+}
+
+impl<'pool, M> TransactionConnection for bb8::PooledConnection<'pool, M>
+where
+    M: bb8::ManageConnection<Connection = Client>,
+{
+    fn as_client_mut(&mut self) -> &mut Client {
+        self
+    }
+}
+
+/// A jOOQ-style, executor-bound DSL context.
+///
+/// The executor may be a single connection, a transaction, or a pool that
+/// acquires on demand.
+pub struct DslContext<E: Executor> {
+    executor: E,
     context: Context,
 }
 
-impl<C> DslContext<C> {
-    fn new(connection: C) -> Self {
+impl<E> Clone for DslContext<E>
+where
+    E: Executor + Clone,
+{
+    fn clone(&self) -> Self {
         Self {
-            connection,
-            context: Context::new(),
+            executor: self.executor.clone(),
+            context: self.context,
         }
     }
 }
 
-impl<C> DslContext<C>
+impl<E> DslContext<E>
 where
-    C: ConnectionRef,
+    E: Executor,
 {
-    pub fn select<S>(
-        &self,
-        selection: S,
-    ) -> AttachedSelectQuery<'_, C::Client, S::Record, S::SingleSql>
+    fn new(executor: E) -> Self {
+        Self {
+            executor,
+            context: Context::new(),
+        }
+    }
+
+    pub fn select<S>(&self, selection: S) -> AttachedSelectQuery<'_, E, S::Record, S::SingleSql>
     where
         S: Selectable,
     {
         AttachedSelectQuery {
             query: self.context.select(selection),
-            client: self.connection.as_client(),
+            executor: &self.executor,
         }
     }
 
-    pub fn with<R, S, Q>(&self, name: &'static str, query: Q) -> AttachedWithBuilder<'_, C::Client>
+    pub fn with<R, S, Q>(&self, name: &'static str, query: Q) -> AttachedWithBuilder<'_, E>
     where
         Q: IntoDetachedSelectQuery<R, S>,
     {
         AttachedWithBuilder {
             builder: self.context.with(name, query.into_select_query()),
-            client: self.connection.as_client(),
+            executor: &self.executor,
         }
     }
 
-    pub fn insert_into(&self, table: Table) -> AttachedInsertQuery<'_, C::Client> {
+    pub fn insert_into(&self, table: Table) -> AttachedInsertQuery<'_, E> {
         AttachedInsertQuery {
             query: self.context.insert_into(table),
-            client: self.connection.as_client(),
+            executor: &self.executor,
         }
     }
 
-    pub fn update(&self, table: Table) -> AttachedUpdateQuery<'_, C::Client> {
+    pub fn update(&self, table: Table) -> AttachedUpdateQuery<'_, E> {
         AttachedUpdateQuery {
             query: self.context.update(table),
-            client: self.connection.as_client(),
+            executor: &self.executor,
         }
     }
 
-    pub fn delete_from(&self, table: Table) -> AttachedDeleteQuery<'_, C::Client> {
+    pub fn delete_from(&self, table: Table) -> AttachedDeleteQuery<'_, E> {
         AttachedDeleteQuery {
             query: self.context.delete_from(table),
-            client: self.connection.as_client(),
+            executor: &self.executor,
         }
     }
 
-    pub fn raw(&self, sql: impl Into<String>) -> AttachedRawQuery<'_, C::Client> {
+    pub fn raw(&self, sql: impl Into<String>) -> AttachedRawQuery<'_, E> {
         AttachedRawQuery {
             query: raw(sql),
-            client: self.connection.as_client(),
+            executor: &self.executor,
         }
     }
 }
 
-impl<C> DslContext<&mut C>
+async fn transaction_with_client<F, T>(client: &mut Client, f: F) -> Result<T>
 where
-    C: GenericClient + Sync + ?Sized,
+    F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
 {
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|err| Error::execution(err.to_string()))?;
+
+    match f(DslContext::new(&transaction)).await {
+        Ok(value) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|err| Error::execution(err.to_string()))?;
+            Ok(value)
+        }
+        Err(err) => {
+            if let Err(rollback_err) = transaction.rollback().await {
+                return Err(Error::execution(format!(
+                    "transaction rollback failed: {rollback_err}"
+                )));
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn transaction_with_transaction<F, T>(transaction: &mut Transaction<'_>, f: F) -> Result<T>
+where
+    F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
+{
+    let transaction = transaction
+        .transaction()
+        .await
+        .map_err(|err| Error::execution(err.to_string()))?;
+
+    match f(DslContext::new(&transaction)).await {
+        Ok(value) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|err| Error::execution(err.to_string()))?;
+            Ok(value)
+        }
+        Err(err) => {
+            if let Err(rollback_err) = transaction.rollback().await {
+                return Err(Error::execution(format!(
+                    "transaction rollback failed: {rollback_err}"
+                )));
+            }
+            Err(err)
+        }
+    }
+}
+
+impl<E> DslContext<E>
+where
+    E: Executor,
+    for<'conn> E::Conn<'conn>: TransactionConnection,
+{
+    /// Run a closure inside a PostgreSQL transaction.
+    pub async fn transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
+    {
+        let mut conn = self.executor.acquire().await?;
+        transaction_with_client(conn.as_client_mut(), f).await
+    }
+}
+
+impl DslContext<&Client> {
+    /// Reuse this connection for several queries in one callback.
+    pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
+    where
+        F: for<'conn> FnOnce(DslContext<&'conn Client>) -> TransactionFuture<'conn, T>,
+    {
+        f(DslContext::new(self.executor)).await
+    }
+}
+
+impl DslContext<&mut Client> {
     /// Run a closure inside a PostgreSQL transaction.
     pub async fn transaction<F, T>(&mut self, f: F) -> Result<T>
     where
         F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
     {
-        let tx = self
-            .connection
-            .transaction()
-            .await
-            .map_err(|err| Error::execution(err.to_string()))?;
+        transaction_with_client(self.executor, f).await
+    }
 
-        match f(DslContext::new(&tx)).await {
-            Ok(value) => {
-                tx.commit()
-                    .await
-                    .map_err(|err| Error::execution(err.to_string()))?;
-                Ok(value)
-            }
-            Err(err) => {
-                if let Err(rollback_err) = tx.rollback().await {
-                    return Err(Error::execution(format!(
-                        "transaction rollback failed: {rollback_err}"
-                    )));
-                }
-                Err(err)
-            }
-        }
+    /// Reuse this connection for several queries in one callback.
+    pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
+    where
+        F: for<'conn> FnOnce(DslContext<&'conn Client>) -> TransactionFuture<'conn, T>,
+    {
+        f(DslContext::new(&*self.executor)).await
+    }
+}
+
+impl<'transaction, 'client> DslContext<&'transaction mut Transaction<'client>>
+where
+    'client: 'transaction,
+{
+    /// Run a closure inside a nested PostgreSQL transaction.
+    pub async fn transaction<F, T>(&mut self, f: F) -> Result<T>
+    where
+        F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
+    {
+        transaction_with_transaction(self.executor, f).await
+    }
+}
+
+impl<'transaction, 'client> DslContext<&'transaction Transaction<'client>>
+where
+    'client: 'transaction,
+{
+    /// Reuse this transaction for several queries in one callback.
+    pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
+    where
+        F: for<'conn> FnOnce(
+            DslContext<&'conn Transaction<'client>>,
+        ) -> TransactionFuture<'conn, T>,
+    {
+        f(DslContext::new(self.executor)).await
+    }
+}
+
+impl DslContext<Pool> {
+    /// Acquire one physical connection and run multiple queries against it.
+    pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
+    where
+        F: for<'conn> FnOnce(DslContext<&'conn Client>) -> TransactionFuture<'conn, T>,
+    {
+        let conn = self.executor.acquire().await?;
+        f(DslContext::new(conn.as_client())).await
+    }
+}
+
+impl<M> DslContext<bb8::Pool<M>>
+where
+    M: bb8::ManageConnection<Connection = Client> + Sync,
+    M::Error: std::fmt::Debug + Send + Sync + 'static,
+    for<'a> bb8::PooledConnection<'a, M>: Send + Sync,
+{
+    /// Acquire one physical connection and run multiple queries against it.
+    pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
+    where
+        F: for<'conn> FnOnce(DslContext<&'conn Client>) -> TransactionFuture<'conn, T>,
+    {
+        let conn = self.executor.acquire().await?;
+        f(DslContext::new(conn.as_client())).await
     }
 }
 
@@ -282,24 +624,21 @@ impl_tuple_from_row!(14, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10,
 impl_tuple_from_row!(15, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12, N 13, O 14);
 impl_tuple_from_row!(16, A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12, N 13, O 14, P 15);
 
-struct PortalStreamState<'tx, 'client> {
-    transaction: &'tx Transaction<'client>,
+struct PortalStreamState<C> {
+    connection: C,
     portal: Portal,
     current: Option<Pin<Box<RowStream>>>,
     current_yielded: bool,
     done: bool,
 }
 
-fn portal_stream<'tx, 'client, R>(
-    transaction: &'tx Transaction<'client>,
-    portal: Portal,
-) -> PgStream<'tx, R>
+fn portal_stream<'a, C, R>(connection: C, portal: Portal) -> PgStream<'a, R>
 where
-    'client: 'tx,
-    R: FromRow + Send + 'tx,
+    C: AcquiredConnection + Send + 'a,
+    R: FromRow + Send + 'a,
 {
     let state = PortalStreamState {
-        transaction,
+        connection,
         portal,
         current: None,
         current_yielded: false,
@@ -313,8 +652,11 @@ where
             }
 
             if state.current.is_none() {
-                let row_stream = state
-                    .transaction
+                let transaction = state
+                    .connection
+                    .as_transaction()
+                    .ok_or_else(|| Error::execution(STREAMING_REQUIRES_TRANSACTION))?;
+                let row_stream = transaction
                     .query_portal_raw(&state.portal, DEFAULT_PORTAL_FETCH_ROWS)
                     .await
                     .map_err(|err| Error::execution(err.to_string()))?;
@@ -346,105 +688,116 @@ where
     }))
 }
 
-fn execute_query<'a, C, Q>(client: &'a C, query: Q) -> PgFuture<'a, u64>
+fn execute_query<'a, E, Q>(executor: &'a E, query: Q) -> PgFuture<'a, u64>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
     Q: RenderQuery + Send + 'a,
 {
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
-        client
+        let conn = executor.acquire().await?;
+        conn.as_client()
             .execute(rendered.sql(), params.as_slice())
             .await
             .map_err(|err| Error::execution(err.to_string()))
     })
 }
 
-fn fetch_all_query<'a, C, Q, R>(client: &'a C, query: Q) -> PgFuture<'a, Vec<R>>
+fn fetch_all_query<'a, E, Q, R>(executor: &'a E, query: Q) -> PgFuture<'a, Vec<R>>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
     Q: RenderQuery + Send + 'a,
     R: FromRow + Send + 'a,
 {
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
-        let rows = client
-            .query(rendered.sql(), params.as_slice())
-            .await
-            .map_err(|err| Error::execution(err.to_string()))?;
+        let rows = {
+            let conn = executor.acquire().await?;
+            conn.as_client()
+                .query(rendered.sql(), params.as_slice())
+                .await
+                .map_err(|err| Error::execution(err.to_string()))?
+        };
 
         rows.iter().map(R::from_row).collect()
     })
 }
 
-fn fetch_one_query<'a, C, Q, R>(client: &'a C, query: Q) -> PgFuture<'a, R>
+fn fetch_one_query<'a, E, Q, R>(executor: &'a E, query: Q) -> PgFuture<'a, R>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
     Q: RenderQuery + Send + 'a,
     R: FromRow + Send + 'a,
 {
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
-        let row = client
-            .query_one(rendered.sql(), params.as_slice())
-            .await
-            .map_err(|err| Error::execution(err.to_string()))?;
+        let row = {
+            let conn = executor.acquire().await?;
+            conn.as_client()
+                .query_one(rendered.sql(), params.as_slice())
+                .await
+                .map_err(|err| Error::execution(err.to_string()))?
+        };
 
         R::from_row(&row)
     })
 }
 
-fn fetch_optional_query<'a, C, Q, R>(client: &'a C, query: Q) -> PgFuture<'a, Option<R>>
+fn fetch_optional_query<'a, E, Q, R>(executor: &'a E, query: Q) -> PgFuture<'a, Option<R>>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
     Q: RenderQuery + Send + 'a,
     R: FromRow + Send + 'a,
 {
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
-        let row = client
-            .query_opt(rendered.sql(), params.as_slice())
-            .await
-            .map_err(|err| Error::execution(err.to_string()))?;
+        let row = {
+            let conn = executor.acquire().await?;
+            conn.as_client()
+                .query_opt(rendered.sql(), params.as_slice())
+                .await
+                .map_err(|err| Error::execution(err.to_string()))?
+        };
 
         row.as_ref().map(R::from_row).transpose()
     })
 }
 
-fn fetch_stream_query<'tx, 'client, Q, R>(
-    transaction: &'tx Transaction<'client>,
-    query: Q,
-) -> PgFuture<'tx, PgStream<'tx, R>>
+fn fetch_stream_query<'a, E, Q, R>(executor: &'a E, query: Q) -> PgFuture<'a, PgStream<'a, R>>
 where
-    'client: 'tx,
-    Q: RenderQuery + Send + 'tx,
-    R: FromRow + Send + 'tx,
+    E: Executor,
+    Q: RenderQuery + Send + 'a,
+    R: FromRow + Send + 'a,
 {
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
+        let conn = executor.acquire().await?;
+        let transaction = conn
+            .as_transaction()
+            .ok_or_else(|| Error::execution(STREAMING_REQUIRES_TRANSACTION))?;
         let portal = transaction
             .bind(rendered.sql(), params.as_slice())
             .await
             .map_err(|err| Error::execution(err.to_string()))?;
 
-        Ok(portal_stream(transaction, portal))
+        Ok(portal_stream(conn, portal))
     })
 }
 
-fn fetch_chunked_query<'tx, 'client, Q, R>(
-    transaction: &'tx Transaction<'client>,
+fn fetch_chunked_query<'a, E, Q, R>(
+    executor: &'a E,
     query: Q,
     n: usize,
-) -> PgFuture<'tx, PgStream<'tx, Vec<R>>>
+) -> PgFuture<'a, PgStream<'a, Vec<R>>>
 where
-    'client: 'tx,
-    Q: RenderQuery + Send + 'tx,
-    R: FromRow + Send + 'tx,
+    E: Executor,
+    Q: RenderQuery + Send + 'a,
+    R: FromRow + Send + 'a,
 {
     Box::pin(async move {
         if n == 0 {
@@ -453,7 +806,7 @@ where
             ));
         }
 
-        let rows = fetch_stream_query::<_, R>(transaction, query).await?;
+        let rows = fetch_stream_query::<_, _, R>(executor, query).await?;
         let chunks = stream::try_unfold(
             (rows, Vec::with_capacity(n)),
             move |(mut rows, mut chunk)| async move {
@@ -478,7 +831,7 @@ where
                 }
             },
         );
-        let chunks: PgStream<'tx, Vec<R>> = Box::pin(chunks);
+        let chunks: PgStream<'a, Vec<R>> = Box::pin(chunks);
 
         Ok(chunks)
     })
@@ -495,47 +848,41 @@ impl<R, S> IntoDetachedSelectQuery<R, S> for SelectQuery<R, S> {
     }
 }
 
-pub struct AttachedSelectQuery<'a, C: ?Sized, R = (), S = fuwa_core::NotSingleColumn> {
+pub struct AttachedSelectQuery<'a, E: Executor, R = (), S = fuwa_core::NotSingleColumn> {
     query: SelectQuery<R, S>,
-    client: &'a C,
+    executor: &'a E,
 }
 
-impl<'a, C, R, S> IntoDetachedSelectQuery<R, S> for AttachedSelectQuery<'a, C, R, S>
-where
-    C: ?Sized,
-{
+impl<'a, E: Executor, R, S> IntoDetachedSelectQuery<R, S> for AttachedSelectQuery<'a, E, R, S> {
     fn into_select_query(self) -> SelectQuery<R, S> {
         self.query
     }
 }
 
-impl<'a, C, T, R> InOperand<T> for AttachedSelectQuery<'a, C, R, T>
-where
-    C: ?Sized,
-{
+impl<'a, E: Executor, T, R> InOperand<T> for AttachedSelectQuery<'a, E, R, T> {
     fn into_in_operand(self) -> InOperandNode {
         self.query.into_in_operand()
     }
 }
 
-impl<'a, C, R, S> AttachedSelectQuery<'a, C, R, S>
+impl<'a, E, R, S> AttachedSelectQuery<'a, E, R, S>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
 {
     pub fn distinct(self) -> Self {
         Self {
             query: self.query.distinct(),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
-    pub fn distinct_on<E>(self, columns: E) -> Self
+    pub fn distinct_on<Columns>(self, columns: Columns) -> Self
     where
-        E: ExprList,
+        Columns: ExprList,
     {
         Self {
             query: self.query.distinct_on(columns),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
@@ -545,45 +892,45 @@ where
     {
         Self {
             query: self.query.from(source),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
     pub fn join(self, target: JoinTarget) -> Self {
         Self {
             query: self.query.join(target),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
     pub fn left_join(self, target: JoinTarget) -> Self {
         Self {
             query: self.query.left_join(target),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
     pub fn where_(self, condition: fuwa_core::Condition) -> Self {
         Self {
             query: self.query.where_(condition),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
-    pub fn group_by<E>(self, group_by: E) -> Self
+    pub fn group_by<GroupBy>(self, group_by: GroupBy) -> Self
     where
-        E: ExprList,
+        GroupBy: ExprList,
     {
         Self {
             query: self.query.group_by(group_by),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
     pub fn having(self, condition: fuwa_core::Condition) -> Self {
         Self {
             query: self.query.having(condition),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
@@ -593,21 +940,21 @@ where
     {
         Self {
             query: self.query.order_by(order_by),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
     pub fn limit(self, limit: i64) -> Self {
         Self {
             query: self.query.limit(limit),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
     pub fn offset(self, offset: i64) -> Self {
         Self {
             query: self.query.offset(offset),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
@@ -623,7 +970,7 @@ where
     where
         SelectQuery<R, S>: Send + 'a,
     {
-        execute_query(self.client, self.query)
+        execute_query(self.executor, self.query)
     }
 
     pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
@@ -631,7 +978,7 @@ where
         SelectQuery<R, S>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_all_query(self.client, self.query)
+        fetch_all_query(self.executor, self.query)
     }
 
     pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
@@ -639,7 +986,7 @@ where
         SelectQuery<R, S>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_one_query(self.client, self.query)
+        fetch_one_query(self.executor, self.query)
     }
 
     pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
@@ -647,39 +994,34 @@ where
         SelectQuery<R, S>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_optional_query(self.client, self.query)
+        fetch_optional_query(self.executor, self.query)
+    }
+
+    pub fn fetch_stream<Row>(self) -> PgFuture<'a, PgStream<'a, Row>>
+    where
+        SelectQuery<R, S>: Send + 'a,
+        Row: FromRow + Send + 'a,
+    {
+        fetch_stream_query(self.executor, self.query)
+    }
+
+    pub fn fetch_chunked<Row>(self, n: usize) -> PgFuture<'a, PgStream<'a, Vec<Row>>>
+    where
+        SelectQuery<R, S>: Send + 'a,
+        Row: FromRow + Send + 'a,
+    {
+        fetch_chunked_query(self.executor, self.query, n)
     }
 }
 
-impl<'tx, 'client, R, S> AttachedSelectQuery<'tx, Transaction<'client>, R, S>
-where
-    'client: 'tx,
-{
-    pub fn fetch_stream<Row>(self) -> PgFuture<'tx, PgStream<'tx, Row>>
-    where
-        SelectQuery<R, S>: Send + 'tx,
-        Row: FromRow + Send + 'tx,
-    {
-        fetch_stream_query(self.client, self.query)
-    }
-
-    pub fn fetch_chunked<Row>(self, n: usize) -> PgFuture<'tx, PgStream<'tx, Vec<Row>>>
-    where
-        SelectQuery<R, S>: Send + 'tx,
-        Row: FromRow + Send + 'tx,
-    {
-        fetch_chunked_query(self.client, self.query, n)
-    }
-}
-
-pub struct AttachedWithBuilder<'a, C: ?Sized> {
+pub struct AttachedWithBuilder<'a, E: Executor> {
     builder: WithBuilder,
-    client: &'a C,
+    executor: &'a E,
 }
 
-impl<'a, C> AttachedWithBuilder<'a, C>
+impl<'a, E> AttachedWithBuilder<'a, E>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
 {
     pub fn with<R, S, Q>(self, name: &'static str, query: Q) -> Self
     where
@@ -687,29 +1029,29 @@ where
     {
         Self {
             builder: self.builder.with(name, query.into_select_query()),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
-    pub fn select<S>(self, selection: S) -> AttachedSelectQuery<'a, C, S::Record, S::SingleSql>
+    pub fn select<S>(self, selection: S) -> AttachedSelectQuery<'a, E, S::Record, S::SingleSql>
     where
         S: Selectable,
     {
         AttachedSelectQuery {
             query: self.builder.select(selection),
-            client: self.client,
+            executor: self.executor,
         }
     }
 }
 
-pub struct AttachedInsertQuery<'a, C: ?Sized, R = ()> {
+pub struct AttachedInsertQuery<'a, E: Executor, R = ()> {
     query: InsertQuery<R>,
-    client: &'a C,
+    executor: &'a E,
 }
 
-impl<'a, C, R> AttachedInsertQuery<'a, C, R>
+impl<'a, E, R> AttachedInsertQuery<'a, E, R>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
 {
     pub fn values<A>(self, assignments: A) -> Self
     where
@@ -717,7 +1059,7 @@ where
     {
         Self {
             query: self.query.values(assignments),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
@@ -728,27 +1070,27 @@ where
     {
         Self {
             query: self.query.values_many(rows),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
-    pub fn on_conflict<T>(self, target: T) -> AttachedInsertConflictBuilder<'a, C, R>
+    pub fn on_conflict<T>(self, target: T) -> AttachedInsertConflictBuilder<'a, E, R>
     where
         T: ConflictTarget,
     {
         AttachedInsertConflictBuilder {
             builder: self.query.on_conflict(target),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
-    pub fn returning<S>(self, selection: S) -> AttachedInsertQuery<'a, C, S::Record>
+    pub fn returning<S>(self, selection: S) -> AttachedInsertQuery<'a, E, S::Record>
     where
         S: Selectable,
     {
         AttachedInsertQuery {
             query: self.query.returning(selection),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
@@ -760,7 +1102,7 @@ where
     where
         InsertQuery<R>: Send + 'a,
     {
-        execute_query(self.client, self.query)
+        execute_query(self.executor, self.query)
     }
 
     pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
@@ -768,7 +1110,7 @@ where
         InsertQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_all_query(self.client, self.query)
+        fetch_all_query(self.executor, self.query)
     }
 
     pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
@@ -776,7 +1118,7 @@ where
         InsertQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_one_query(self.client, self.query)
+        fetch_one_query(self.executor, self.query)
     }
 
     pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
@@ -784,46 +1126,46 @@ where
         InsertQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_optional_query(self.client, self.query)
+        fetch_optional_query(self.executor, self.query)
     }
 }
 
-pub struct AttachedInsertConflictBuilder<'a, C: ?Sized, R = ()> {
+pub struct AttachedInsertConflictBuilder<'a, E: Executor, R = ()> {
     builder: InsertConflictBuilder<R>,
-    client: &'a C,
+    executor: &'a E,
 }
 
-impl<'a, C, R> AttachedInsertConflictBuilder<'a, C, R>
+impl<'a, E, R> AttachedInsertConflictBuilder<'a, E, R>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
 {
-    pub fn do_nothing(self) -> AttachedInsertQuery<'a, C, R> {
+    pub fn do_nothing(self) -> AttachedInsertQuery<'a, E, R> {
         AttachedInsertQuery {
             query: self.builder.do_nothing(),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
-    pub fn do_update<F, A>(self, f: F) -> AttachedInsertQuery<'a, C, R>
+    pub fn do_update<F, A>(self, f: F) -> AttachedInsertQuery<'a, E, R>
     where
         F: FnOnce(Excluded) -> A,
         A: Assignments,
     {
         AttachedInsertQuery {
             query: self.builder.do_update(f),
-            client: self.client,
+            executor: self.executor,
         }
     }
 }
 
-pub struct AttachedUpdateQuery<'a, C: ?Sized, R = ()> {
+pub struct AttachedUpdateQuery<'a, E: Executor, R = ()> {
     query: UpdateQuery<R>,
-    client: &'a C,
+    executor: &'a E,
 }
 
-impl<'a, C, R> AttachedUpdateQuery<'a, C, R>
+impl<'a, E, R> AttachedUpdateQuery<'a, E, R>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
 {
     pub fn set<A>(self, assignments: A) -> Self
     where
@@ -831,24 +1173,24 @@ where
     {
         Self {
             query: self.query.set(assignments),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
     pub fn where_(self, condition: fuwa_core::Condition) -> Self {
         Self {
             query: self.query.where_(condition),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
-    pub fn returning<S>(self, selection: S) -> AttachedUpdateQuery<'a, C, S::Record>
+    pub fn returning<S>(self, selection: S) -> AttachedUpdateQuery<'a, E, S::Record>
     where
         S: Selectable,
     {
         AttachedUpdateQuery {
             query: self.query.returning(selection),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
@@ -860,7 +1202,7 @@ where
     where
         UpdateQuery<R>: Send + 'a,
     {
-        execute_query(self.client, self.query)
+        execute_query(self.executor, self.query)
     }
 
     pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
@@ -868,7 +1210,7 @@ where
         UpdateQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_all_query(self.client, self.query)
+        fetch_all_query(self.executor, self.query)
     }
 
     pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
@@ -876,7 +1218,7 @@ where
         UpdateQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_one_query(self.client, self.query)
+        fetch_one_query(self.executor, self.query)
     }
 
     pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
@@ -884,33 +1226,33 @@ where
         UpdateQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_optional_query(self.client, self.query)
+        fetch_optional_query(self.executor, self.query)
     }
 }
 
-pub struct AttachedDeleteQuery<'a, C: ?Sized, R = ()> {
+pub struct AttachedDeleteQuery<'a, E: Executor, R = ()> {
     query: DeleteQuery<R>,
-    client: &'a C,
+    executor: &'a E,
 }
 
-impl<'a, C, R> AttachedDeleteQuery<'a, C, R>
+impl<'a, E, R> AttachedDeleteQuery<'a, E, R>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
 {
     pub fn where_(self, condition: fuwa_core::Condition) -> Self {
         Self {
             query: self.query.where_(condition),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
-    pub fn returning<S>(self, selection: S) -> AttachedDeleteQuery<'a, C, S::Record>
+    pub fn returning<S>(self, selection: S) -> AttachedDeleteQuery<'a, E, S::Record>
     where
         S: Selectable,
     {
         AttachedDeleteQuery {
             query: self.query.returning(selection),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
@@ -922,7 +1264,7 @@ where
     where
         DeleteQuery<R>: Send + 'a,
     {
-        execute_query(self.client, self.query)
+        execute_query(self.executor, self.query)
     }
 
     pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
@@ -930,7 +1272,7 @@ where
         DeleteQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_all_query(self.client, self.query)
+        fetch_all_query(self.executor, self.query)
     }
 
     pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
@@ -938,7 +1280,7 @@ where
         DeleteQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_one_query(self.client, self.query)
+        fetch_one_query(self.executor, self.query)
     }
 
     pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
@@ -946,18 +1288,18 @@ where
         DeleteQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_optional_query(self.client, self.query)
+        fetch_optional_query(self.executor, self.query)
     }
 }
 
-pub struct AttachedRawQuery<'a, C: ?Sized, R = ()> {
+pub struct AttachedRawQuery<'a, E: Executor, R = ()> {
     query: RawQuery<R>,
-    client: &'a C,
+    executor: &'a E,
 }
 
-impl<'a, C, R> AttachedRawQuery<'a, C, R>
+impl<'a, E, R> AttachedRawQuery<'a, E, R>
 where
-    C: GenericClient + Sync + ?Sized,
+    E: Executor,
 {
     pub fn bind<T>(self, value: T) -> Self
     where
@@ -965,14 +1307,14 @@ where
     {
         Self {
             query: self.query.bind(value),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
-    pub fn record<T>(self) -> AttachedRawQuery<'a, C, T> {
+    pub fn record<T>(self) -> AttachedRawQuery<'a, E, T> {
         AttachedRawQuery {
             query: self.query.record(),
-            client: self.client,
+            executor: self.executor,
         }
     }
 
@@ -984,7 +1326,7 @@ where
     where
         RawQuery<R>: Send + 'a,
     {
-        execute_query(self.client, self.query)
+        execute_query(self.executor, self.query)
     }
 
     pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
@@ -992,7 +1334,7 @@ where
         RawQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_all_query(self.client, self.query)
+        fetch_all_query(self.executor, self.query)
     }
 
     pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
@@ -1000,7 +1342,7 @@ where
         RawQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_one_query(self.client, self.query)
+        fetch_one_query(self.executor, self.query)
     }
 
     pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
@@ -1008,27 +1350,22 @@ where
         RawQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
-        fetch_optional_query(self.client, self.query)
-    }
-}
-
-impl<'tx, 'client, R> AttachedRawQuery<'tx, Transaction<'client>, R>
-where
-    'client: 'tx,
-{
-    pub fn fetch_stream<Row>(self) -> PgFuture<'tx, PgStream<'tx, Row>>
-    where
-        RawQuery<R>: Send + 'tx,
-        Row: FromRow + Send + 'tx,
-    {
-        fetch_stream_query(self.client, self.query)
+        fetch_optional_query(self.executor, self.query)
     }
 
-    pub fn fetch_chunked<Row>(self, n: usize) -> PgFuture<'tx, PgStream<'tx, Vec<Row>>>
+    pub fn fetch_stream<Row>(self) -> PgFuture<'a, PgStream<'a, Row>>
     where
-        RawQuery<R>: Send + 'tx,
-        Row: FromRow + Send + 'tx,
+        RawQuery<R>: Send + 'a,
+        Row: FromRow + Send + 'a,
     {
-        fetch_chunked_query(self.client, self.query, n)
+        fetch_stream_query(self.executor, self.query)
+    }
+
+    pub fn fetch_chunked<Row>(self, n: usize) -> PgFuture<'a, PgStream<'a, Vec<Row>>>
+    where
+        RawQuery<R>: Send + 'a,
+        Row: FromRow + Send + 'a,
+    {
+        fetch_chunked_query(self.executor, self.query, n)
     }
 }

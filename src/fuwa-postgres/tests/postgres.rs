@@ -1,13 +1,37 @@
 extern crate fuwa_postgres as fuwa;
 
-use futures_util::StreamExt;
+use std::sync::Arc;
+
 use fuwa_core::prelude::*;
 use fuwa_derive::FromRow;
-use fuwa_postgres::Dsl;
+use fuwa_postgres::{create_pool_with_options, Dsl, Pool, PoolOptions, StreamExt};
 use rust_decimal::Decimal;
 use tokio_postgres::NoTls;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+fn test_pool(
+    database_url: &str,
+    max_size: usize,
+) -> std::result::Result<Pool, Box<dyn std::error::Error>> {
+    Ok(create_pool_with_options(
+        database_url,
+        PoolOptions { max_size },
+    )?)
+}
+
+#[test]
+fn pool_options_reject_zero_max_size() {
+    let err = match create_pool_with_options(
+        "host=localhost user=postgres",
+        PoolOptions { max_size: 0 },
+    ) {
+        Ok(_) => panic!("zero-sized pools should be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(err.to_string().contains("max_size must be greater than zero"));
+}
 
 #[derive(Debug, PartialEq, Eq, FromRow)]
 struct DerivedAccount {
@@ -21,6 +45,16 @@ mod users {
     use fuwa_core::prelude::*;
 
     pub const table: Table = Table::new("public", "fuwa_test_users");
+    pub const id: Field<i64, NotNull> = Field::new(table, "id");
+    pub const email: Field<String, NotNull> = Field::new(table, "email");
+    pub const active: Field<bool, NotNull> = Field::new(table, "active");
+}
+
+#[allow(non_upper_case_globals)]
+mod pool_users {
+    use fuwa_core::prelude::*;
+
+    pub const table: Table = Table::new("public", "fuwa_test_pool_users");
     pub const id: Field<i64, NotNull> = Field::new(table, "id");
     pub const email: Field<String, NotNull> = Field::new(table, "email");
     pub const active: Field<bool, NotNull> = Field::new(table, "active");
@@ -469,8 +503,8 @@ async fn fetch_stream_and_chunked_use_postgres_portals_when_database_url_is_set(
         )
         .await?;
 
-    let tx = client.transaction().await?;
-    let dsl = Dsl::using(&tx);
+    let transaction = client.transaction().await?;
+    let dsl = Dsl::using(&transaction);
     let mut rows = dsl
         .raw(
             r#"
@@ -493,10 +527,10 @@ async fn fetch_stream_and_chunked_use_postgres_portals_when_database_url_is_set(
     assert_eq!(count, 10_000);
     drop(rows);
     drop(dsl);
-    tx.commit().await?;
+    transaction.commit().await?;
 
-    let tx = client.transaction().await?;
-    let dsl = Dsl::using(&tx);
+    let transaction = client.transaction().await?;
+    let dsl = Dsl::using(&transaction);
     let mut chunks = dsl
         .raw(
             r#"
@@ -534,11 +568,197 @@ async fn fetch_stream_and_chunked_use_postgres_portals_when_database_url_is_set(
     assert_eq!(chunk_count, 13);
     drop(chunks);
     drop(dsl);
-    tx.commit().await?;
+    transaction.commit().await?;
 
     client
         .batch_execute("drop table if exists public.fuwa_test_stream_rows;")
         .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mutable_transaction_executor_runs_queries_when_database_url_is_set() -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!("skipping mutable transaction executor integration test: FUWA_TEST_DATABASE_URL is not set");
+        return Ok(());
+    };
+
+    let (mut client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("PostgreSQL connection task failed: {err}");
+        }
+    });
+
+    let mut transaction = client.transaction().await?;
+    let mut dsl = Dsl::using(&mut transaction);
+
+    let value = dsl.raw("select 42::bigint").fetch_one::<i64>().await?;
+    assert_eq!(value, 42);
+
+    let nested_value = dsl
+        .transaction(|tx| {
+            Box::pin(async move { tx.raw("select 43::bigint").fetch_one::<i64>().await })
+        })
+        .await?;
+    assert_eq!(nested_value, 43);
+
+    drop(dsl);
+    transaction.rollback().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pool_dsl_context_acquires_on_execution_and_can_be_shared_when_database_url_is_set(
+) -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!("skipping pool executor integration test: FUWA_TEST_DATABASE_URL is not set");
+        return Ok(());
+    };
+
+    let pool = test_pool(&database_url, 4)?;
+    let dsl = Dsl::using(pool.clone());
+    let shared = Arc::new(dsl.clone());
+
+    let mut handles = Vec::new();
+    for expected in 0_i64..100 {
+        let dsl = Arc::clone(&shared);
+        handles.push(tokio::spawn(async move {
+            dsl.raw("select $1::bigint")
+                .bind(expected)
+                .fetch_one::<i64>()
+                .await
+        }));
+    }
+
+    for (expected, handle) in (0_i64..100).zip(handles) {
+        let actual = handle.await??;
+        assert_eq!(actual, expected);
+    }
+
+    let status = pool.status();
+    assert_eq!(status.max_size, 4);
+    assert!(status.size <= status.max_size);
+
+    let (first_pid, second_pid) = shared
+        .with_connection(|dsl| {
+            Box::pin(async move {
+                let first_pid = dsl
+                    .raw("select pg_backend_pid()")
+                    .fetch_one::<i32>()
+                    .await?;
+                let second_pid = dsl
+                    .raw("select pg_backend_pid()")
+                    .fetch_one::<i32>()
+                    .await?;
+                Ok((first_pid, second_pid))
+            })
+        })
+        .await?;
+    assert_eq!(first_pid, second_pid);
+
+    let err = match shared.raw("select 1::bigint").fetch_stream::<i64>().await {
+        Ok(_) => panic!("pool-level streaming should require an explicit transaction"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("dsl.transaction(|dsl| ...)"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pool_transaction_callback_uses_dsl_context_when_database_url_is_set() -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!("skipping pool transaction integration test: FUWA_TEST_DATABASE_URL is not set");
+        return Ok(());
+    };
+
+    let pool = test_pool(&database_url, 4)?;
+    {
+        let client = pool.get().await?;
+        client
+            .batch_execute(
+                r#"
+                drop table if exists public.fuwa_test_pool_users;
+                create table public.fuwa_test_pool_users (
+                    id bigint primary key,
+                    email text not null unique,
+                    active boolean not null
+                );
+                "#,
+            )
+            .await?;
+    }
+
+    let dsl = Dsl::using(pool.clone());
+    let committed_id = dsl
+        .transaction(|dsl| {
+            Box::pin(async move {
+                dsl.insert_into(pool_users::table)
+                    .values((
+                        pool_users::id.set(bind(1_i64)),
+                        pool_users::email.set(bind("pool-committed@example.com")),
+                        pool_users::active.set(bind(true)),
+                    ))
+                    .returning(pool_users::id)
+                    .fetch_one::<i64>()
+                    .await
+            })
+        })
+        .await?;
+    assert_eq!(committed_id, 1);
+
+    let committed_count = dsl
+        .select(count_star())
+        .from(pool_users::table)
+        .where_(pool_users::email.eq(bind("pool-committed@example.com")))
+        .fetch_one::<i64>()
+        .await?;
+    assert_eq!(committed_count, 1);
+
+    let transaction_result = dsl
+        .transaction(|dsl| {
+            Box::pin(async move {
+                dsl.insert_into(pool_users::table)
+                    .values((
+                        pool_users::id.set(bind(2_i64)),
+                        pool_users::email.set(bind("pool-rolled-back@example.com")),
+                        pool_users::active.set(bind(true)),
+                    ))
+                    .execute()
+                    .await?;
+
+                dsl.insert_into(pool_users::table)
+                    .values((
+                        pool_users::id.set(bind(1_i64)),
+                        pool_users::email.set(bind("pool-duplicate@example.com")),
+                        pool_users::active.set(bind(true)),
+                    ))
+                    .execute()
+                    .await?;
+
+                Ok(())
+            })
+        })
+        .await;
+    assert!(transaction_result.is_err());
+
+    let rolled_back_count = dsl
+        .select(count_star())
+        .from(pool_users::table)
+        .where_(pool_users::email.eq(bind("pool-rolled-back@example.com")))
+        .fetch_one::<i64>()
+        .await?;
+    assert_eq!(rolled_back_count, 0);
+
+    {
+        let client = pool.get().await?;
+        client
+            .batch_execute("drop table if exists public.fuwa_test_pool_users;")
+            .await?;
+    }
 
     Ok(())
 }

@@ -49,3 +49,36 @@ fn fetch_api_shape_compiles(client: &tokio_postgres::Client) {
         .fetch_all::<(i64, String)>();
     drop(future);
 }
+
+#[allow(dead_code)]
+fn borrowed_client_transaction_api_shape_compiles(client: &mut tokio_postgres::Client) {
+    let mut dsl = Dsl::using(client);
+    let future = dsl.transaction(|tx| {
+        Box::pin(async move {
+            tx.raw("select 1").execute().await?;
+            Ok(())
+        })
+    });
+    drop(future);
+}
+
+#[allow(dead_code)]
+fn borrowed_transaction_api_shape_compiles(transaction: &mut tokio_postgres::Transaction<'_>) {
+    let dsl = Dsl::using(transaction);
+    let future = dsl.raw("select 1").fetch_one::<i64>();
+    drop(future);
+}
+
+#[allow(dead_code)]
+fn borrowed_transaction_nested_transaction_api_shape_compiles(
+    transaction: &mut tokio_postgres::Transaction<'_>,
+) {
+    let mut dsl = Dsl::using(transaction);
+    let future = dsl.transaction(|tx| {
+        Box::pin(async move {
+            tx.raw("select 1").execute().await?;
+            Ok(())
+        })
+    });
+    drop(future);
+}

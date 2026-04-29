@@ -17,13 +17,13 @@
 with the `fuwa` DSL, queries read almost the same as the SQL they compile to ~
 typed columns, typed bindings, no string concatenation.
 
-the rust snippets below assume a generated schema module is imported and a
-postgres client has been wrapped once:
+the rust snippets below assume a generated schema module is imported and an
+executor has been wrapped once:
 
 ```rust
 use fuwa::prelude::*;
 
-let dsl = Dsl::using(&client);
+let dsl = Dsl::connect(database_url)?;
 ```
 
 ### simple select
@@ -317,6 +317,7 @@ not a runtime surprise.
 # Cargo.toml
 [dependencies]
 fuwa = { git = "https://github.com/taracutie/fuwa.git" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ### 2. create tables
@@ -462,11 +463,11 @@ use schema::{posts, users};
 
 ### 5. connect and query
 
-`Dsl::using(...)` is the query builder entry point. pass it a postgres
-connection once; queries created from that context are ready to execute. plain
-values passed to comparisons and assignments become bind parameters
-automatically, so they're never just stuffed into the SQL text. `bind(...)`
-still works when you want to be explicit.
+`Dsl::connect(...)` builds fuwa's default postgres pool and returns a
+`DslContext<Pool>`. queries acquire a postgres connection when `.fetch_*()` or
+`.execute()` runs. plain values passed to comparisons and assignments become
+bind parameters automatically, so they're never just stuffed into the SQL text.
+`bind(...)` still works when you want to be explicit.
 
 this example assumes `src/schema.rs` was generated from the `users` + `posts`
 tables up above.
@@ -475,79 +476,58 @@ tables up above.
 mod schema;
 
 use fuwa::prelude::*;
-use schema::{posts, users};
-use tokio_postgres::NoTls;
+use schema::users;
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let database_url = std::env::var("DATABASE_URL")?;
-    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let dsl = Dsl::connect(std::env::var("DATABASE_URL")?)?;
 
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            eprintln!("postgres connection error: {err}");
-        }
-    });
-
-    let dsl = Dsl::using(&client);
-
-    let user_id = dsl
-        .insert_into(users::table)
-        .values((
-            users::email.set("tara@example.com"),
-            users::active.set(true),
-        ))
-        .returning(users::id)
-        .fetch_one::<i64>()
-        .await?;
-
-    let post_id = dsl
-        .insert_into(posts::table)
-        .values((
-            posts::user_id.set(user_id),
-            posts::title.set("hello from fuwa"),
-            posts::published.set(true),
-        ))
-        .returning(posts::id)
-        .fetch_one::<i64>()
-        .await?;
-
-    let joined = dsl
-        .select((users::id, users::email, posts::title))
-        .from(users::table)
-        .join(posts::table.on(posts::user_id.eq(users::id)))
-        .where_(users::active.eq(true).and(posts::published.eq(true)))
-        .order_by((users::id.asc(), posts::id.desc()))
-        .limit(20)
-        .fetch_all::<(i64, String, String)>()
-        .await?;
-
-    let matching_users = dsl
+    let users = dsl
         .select(users::all())
         .from(users::table)
-        .where_(users::email.ilike("%@example.com"))
+        .where_(users::active.eq(true))
         .fetch_all::<users::Record>()
         .await?;
 
-    let renamed_email = dsl
-        .update(users::table)
-        .set(users::email.set("new@example.com"))
-        .where_(users::id.eq(user_id))
-        .returning(users::email)
-        .fetch_one::<String>()
-        .await?;
-
-    let deleted_posts = dsl
-        .delete_from(posts::table)
-        .where_(posts::id.eq(post_id))
-        .execute()
-        .await?;
-
-    println!("{joined:?}");
-    println!("{matching_users:?}");
-    println!("renamed to {renamed_email}, deleted {deleted_posts} post(s)");
-
     Ok(())
+}
+```
+
+use `PoolOptions` when you want to tune the default pool:
+
+```rust
+use fuwa::prelude::*;
+
+let dsl = Dsl::connect_with_options(
+    std::env::var("DATABASE_URL")?,
+    PoolOptions { max_size: 32 },
+)?;
+```
+
+### sharing the dsl across handlers
+
+`DslContext<Pool>` is cheap to clone, so app state can own one shared query
+entry point:
+
+```rust
+use axum::extract::State;
+use fuwa::prelude::*;
+
+#[derive(Clone)]
+struct AppState {
+    dsl: DslContext<Pool>,
+}
+
+async fn handler(State(state): State<AppState>) -> fuwa::Result<String> {
+    let emails = state
+        .dsl
+        .select(users::email)
+        .from(users::table)
+        .where_(users::active.eq(true))
+        .fetch_all::<String>()
+        .await?;
+
+    Ok(format!("{emails:?}"))
 }
 ```
 
@@ -561,13 +541,11 @@ back when the callback returns an error:
 use fuwa::prelude::*;
 
 async fn transaction_example(
-    client: &mut tokio_postgres::Client,
+    dsl: DslContext<Pool>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut dsl = Dsl::using(client);
-
-    dsl.transaction(|tx| {
+    dsl.transaction(|dsl| {
         Box::pin(async move {
-            tx.insert_into(users::table)
+            dsl.insert_into(users::table)
                 .values((
                     users::email.set("queued@example.com"),
                     users::active.set(true),
@@ -592,29 +570,29 @@ context to an open transaction and keep it alive until the stream is exhausted
 or dropped:
 
 ```rust
-use futures_util::StreamExt;
 use fuwa::prelude::*;
 
 async fn stream_example(
-    client: &mut tokio_postgres::Client,
+    dsl: DslContext<Pool>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let tx = client.transaction().await?;
+    dsl.transaction(|dsl| {
+        Box::pin(async move {
+            let mut chunks = dsl
+                .raw("select id, email from users order by id")
+                .fetch_chunked::<(i64, String)>(500)
+                .await?;
 
-    {
-        let dsl = Dsl::using(&tx);
-        let mut chunks = dsl
-            .raw("select id, email from users order by id")
-            .fetch_chunked::<(i64, String)>(500)
-            .await?;
-
-        while let Some(chunk) = chunks.next().await {
-            for (id, email) in chunk? {
-                println!("{id}: {email}");
+            while let Some(chunk) = chunks.next().await {
+                for (id, email) in chunk? {
+                    println!("{id}: {email}");
+                }
             }
-        }
-    }
 
-    tx.commit().await?;
+            Ok(())
+        })
+    })
+    .await?;
+
     Ok(())
 }
 ```
@@ -626,8 +604,7 @@ for SQL the typed DSL doesnt cover yet, you can drop into raw SQL with separate 
 ```rust
 use fuwa::prelude::*;
 
-async fn raw_example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
-    let dsl = Dsl::using(client);
+async fn raw_example(dsl: &DslContext<Pool>) -> fuwa::Result<()> {
     let rows = dsl
         .raw(r#"select email from users where email ~* $1"#)
         .bind(r"@example\.com$")

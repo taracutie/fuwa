@@ -1,6 +1,6 @@
 //! Public facade crate for `fuwa`.
 //!
-//! `fuwa` re-exports the core typed SQL DSL and the PostgreSQL connection-bound
+//! `fuwa` re-exports the core typed SQL DSL and the PostgreSQL executor-bound
 //! execution context. Most applications should depend on this crate rather than the
 //! internal crates.
 //!
@@ -32,9 +32,10 @@ pub use fuwa_core::{
 };
 pub use fuwa_derive::FromRow;
 pub use fuwa_postgres::{
-    AttachedDeleteQuery, AttachedInsertConflictBuilder, AttachedInsertQuery, AttachedRawQuery,
-    AttachedSelectQuery, AttachedUpdateQuery, AttachedWithBuilder, Dsl, DslContext, FromRow,
-    PgFuture, PgStream, Row, TransactionFuture,
+    create_pool, create_pool_with_options, AttachedDeleteQuery, AttachedInsertConflictBuilder,
+    AttachedInsertQuery, AttachedRawQuery, AttachedSelectQuery, AttachedUpdateQuery,
+    AttachedWithBuilder, Dsl, DslContext, Executor, FromRow, PgFuture, PgStream, Pool, PoolOptions,
+    Row, StreamExt, TransactionFuture,
 };
 
 /// Re-exported external types used by generated schema modules.
@@ -48,9 +49,10 @@ pub mod types {
 /// PostgreSQL-specific execution exports.
 pub mod postgres {
     pub use fuwa_postgres::{
-        types, AttachedDeleteQuery, AttachedInsertConflictBuilder, AttachedInsertQuery,
-        AttachedRawQuery, AttachedSelectQuery, AttachedUpdateQuery, AttachedWithBuilder, Dsl,
-        DslContext, FromRow, PgFuture, PgStream, Row, TransactionFuture,
+        create_pool, create_pool_with_options, types, AttachedDeleteQuery,
+        AttachedInsertConflictBuilder, AttachedInsertQuery, AttachedRawQuery, AttachedSelectQuery,
+        AttachedUpdateQuery, AttachedWithBuilder, Dsl, DslContext, Executor, FromRow, PgFuture,
+        PgStream, Pool, PoolOptions, Row, StreamExt, TransactionFuture,
     };
 }
 
@@ -67,5 +69,8 @@ pub mod prelude {
         Table, TableSource, UpdateQuery, WithBuilder,
     };
     pub use fuwa_derive::FromRow;
-    pub use fuwa_postgres::{Dsl, DslContext, FromRow, PgStream, TransactionFuture};
+    pub use fuwa_postgres::{
+        create_pool, create_pool_with_options, Dsl, DslContext, Executor, FromRow, PgStream, Pool,
+        PoolOptions, StreamExt, TransactionFuture,
+    };
 }
