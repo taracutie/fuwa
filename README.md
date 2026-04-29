@@ -75,6 +75,117 @@ ctx.select((posts::account_id, count_star()))
    .order_by(posts::account_id.asc())
 ```
 
+### with / common table expressions
+
+```sql
+with active_accounts as (
+    select id, email
+    from accounts
+    where active = true
+)
+select id, email
+from active_accounts
+where id > 10
+```
+
+```rust
+let active_accounts = Table::unqualified("active_accounts");
+let active_id = active_accounts.field::<i64, NotNull>("id");
+let active_email = active_accounts.field::<String, NotNull>("email");
+
+ctx.with(
+       "active_accounts",
+       ctx.select((accounts::id, accounts::email))
+          .from(accounts::table)
+          .where_(accounts::active.eq(true)),
+   )
+   .select((active_id, active_email))
+   .from(active_accounts)
+   .where_(active_id.gt(10_i64))
+```
+
+### from / join subqueries
+
+```sql
+select recent.id, recent.email
+from (
+    select id, email
+    from accounts
+    where active = true
+) as recent
+where recent.id > 10
+```
+
+```rust
+let recent = ctx
+    .select((accounts::id, accounts::email))
+    .from(accounts::table)
+    .where_(accounts::active.eq(true))
+    .alias("recent");
+let recent_id = recent.field::<i64, NotNull>("id");
+let recent_email = recent.field::<String, NotNull>("email");
+
+ctx.select((recent_id, recent_email))
+   .from(recent)
+   .where_(recent_id.gt(10_i64))
+```
+
+the same aliased subquery source works in joins:
+
+```sql
+select accounts.email, post_counts.account_id
+from accounts
+join (
+    select account_id, count(*)
+    from posts
+    group by account_id
+    having count(*) > 1
+) as post_counts on post_counts.account_id = accounts.id
+where accounts.active = true
+```
+
+```rust
+let post_counts = ctx
+    .select((posts::account_id, count_star()))
+    .from(posts::table)
+    .group_by(posts::account_id)
+    .having(count_star().gt(1_i64))
+    .alias("post_counts");
+let post_counts_account_id = post_counts.field::<i64, NotNull>("account_id");
+
+ctx.select((accounts::email, post_counts_account_id))
+   .from(accounts::table)
+   .join(post_counts.on(post_counts_account_id.eq(accounts::id)))
+   .where_(accounts::active.eq(true))
+```
+
+### in / not in subqueries
+
+```sql
+select id, email
+from accounts
+where id in (
+    select account_id
+    from posts
+    where published = true
+)
+```
+
+```rust
+let published_authors = ctx
+    .select(posts::account_id)
+    .from(posts::table)
+    .where_(posts::published.eq(true));
+
+ctx.select((accounts::id, accounts::email))
+   .from(accounts::table)
+   .where_(accounts::id.in_(published_authors))
+```
+
+`in_(...)` and `not_in(...)` accept arrays, `Vec`s, and single-column
+`SelectQuery`s whose selected SQL type matches the left-hand expression.
+collect custom iterators into a `Vec` before passing them in.
+
 ### case / coalesce / concat
 
 ```sql

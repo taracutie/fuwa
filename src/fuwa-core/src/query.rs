@@ -1,8 +1,9 @@
 use std::marker::PhantomData;
 
 use crate::{
-    Condition, Expr, ExprNode, Field, FieldRef, OrderDirection, OrderExpr, RenderQuery,
-    RenderedQuery, Result, SelectItem, Selectable, Table,
+    AliasedSubquery, Condition, Expr, ExprNode, Field, FieldRef, NotSingleColumn, OrderDirection,
+    OrderExpr, RenderQuery, RenderedQuery, Result, SelectItem, Selectable, Table, TableSource,
+    TableSourceRef,
 };
 
 /// Stateless entry point for building queries.
@@ -14,11 +15,12 @@ impl Context {
         Self
     }
 
-    pub fn select<S>(&self, selection: S) -> SelectQuery<S::Record>
+    pub fn select<S>(&self, selection: S) -> SelectQuery<S::Record, S::SingleSql>
     where
         S: Selectable,
     {
         SelectQuery {
+            ctes: Vec::new(),
             selection: selection.into_select_items(),
             distinct: None,
             from: None,
@@ -30,6 +32,15 @@ impl Context {
             limit: None,
             offset: None,
             marker: PhantomData,
+        }
+    }
+
+    pub fn with<R, S>(&self, name: &'static str, query: SelectQuery<R, S>) -> WithBuilder {
+        WithBuilder {
+            ctes: vec![Cte {
+                name,
+                query: query.erase_record(),
+            }],
         }
     }
 
@@ -65,10 +76,11 @@ impl Context {
 
 /// A `SELECT` query.
 #[derive(Debug)]
-pub struct SelectQuery<R = ()> {
+pub struct SelectQuery<R = (), S = NotSingleColumn> {
+    pub(crate) ctes: Vec<Cte>,
     pub(crate) selection: Vec<SelectItem>,
     pub(crate) distinct: Option<SelectDistinct>,
-    pub(crate) from: Option<Table>,
+    pub(crate) from: Option<TableSourceRef>,
     pub(crate) joins: Vec<Join>,
     pub(crate) where_clause: Option<Condition>,
     pub(crate) group_by: Vec<ExprNode>,
@@ -76,7 +88,50 @@ pub struct SelectQuery<R = ()> {
     pub(crate) order_by: Vec<OrderExpr>,
     pub(crate) limit: Option<i64>,
     pub(crate) offset: Option<i64>,
-    marker: PhantomData<fn() -> R>,
+    marker: PhantomData<fn() -> (R, S)>,
+}
+
+/// A non-recursive common table expression attached to a `SELECT`.
+#[derive(Debug)]
+pub(crate) struct Cte {
+    pub(crate) name: &'static str,
+    pub(crate) query: SelectQuery<(), NotSingleColumn>,
+}
+
+/// Builder for a `WITH ... SELECT ...` query.
+#[derive(Debug)]
+pub struct WithBuilder {
+    pub(crate) ctes: Vec<Cte>,
+}
+
+impl WithBuilder {
+    pub fn with<R, S>(mut self, name: &'static str, query: SelectQuery<R, S>) -> Self {
+        self.ctes.push(Cte {
+            name,
+            query: query.erase_record(),
+        });
+        self
+    }
+
+    pub fn select<S>(self, selection: S) -> SelectQuery<S::Record, S::SingleSql>
+    where
+        S: Selectable,
+    {
+        SelectQuery {
+            ctes: self.ctes,
+            selection: selection.into_select_items(),
+            distinct: None,
+            from: None,
+            joins: Vec::new(),
+            where_clause: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            marker: PhantomData,
+        }
+    }
 }
 
 /// `SELECT` distinct mode.
@@ -86,7 +141,7 @@ pub(crate) enum SelectDistinct {
     DistinctOn(Vec<ExprNode>),
 }
 
-impl<R> SelectQuery<R> {
+impl<R, S> SelectQuery<R, S> {
     pub fn distinct(mut self) -> Self {
         self.distinct = Some(SelectDistinct::Distinct);
         self
@@ -100,15 +155,18 @@ impl<R> SelectQuery<R> {
         self
     }
 
-    pub fn from(mut self, table: Table) -> Self {
-        self.from = Some(table);
+    pub fn from<Source>(mut self, source: Source) -> Self
+    where
+        Source: TableSource,
+    {
+        self.from = Some(source.into_table_source());
         self
     }
 
     pub fn join(mut self, target: JoinTarget) -> Self {
         self.joins.push(Join {
             kind: JoinKind::Inner,
-            table: target.table,
+            source: target.source,
             on: target.on,
         });
         self
@@ -117,7 +175,7 @@ impl<R> SelectQuery<R> {
     pub fn left_join(mut self, target: JoinTarget) -> Self {
         self.joins.push(Join {
             kind: JoinKind::Left,
-            table: target.table,
+            source: target.source,
             on: target.on,
         });
         self
@@ -165,8 +223,29 @@ impl<R> SelectQuery<R> {
         self
     }
 
+    pub fn alias(self, alias: &'static str) -> AliasedSubquery {
+        AliasedSubquery::new(self, alias)
+    }
+
     pub fn render(self) -> Result<RenderedQuery> {
         RenderQuery::render(self)
+    }
+
+    pub(crate) fn erase_record(self) -> SelectQuery<(), NotSingleColumn> {
+        SelectQuery {
+            ctes: self.ctes,
+            selection: self.selection,
+            distinct: self.distinct,
+            from: self.from,
+            joins: self.joins,
+            where_clause: self.where_clause,
+            group_by: self.group_by,
+            having: self.having,
+            order_by: self.order_by,
+            limit: self.limit,
+            offset: self.offset,
+            marker: PhantomData,
+        }
     }
 }
 
@@ -225,14 +304,14 @@ pub enum JoinKind {
 #[derive(Debug)]
 pub struct Join {
     pub(crate) kind: JoinKind,
-    pub(crate) table: Table,
+    pub(crate) source: TableSourceRef,
     pub(crate) on: Condition,
 }
 
 /// A table plus `ON` condition before the join kind is chosen.
 #[derive(Debug)]
 pub struct JoinTarget {
-    pub(crate) table: Table,
+    pub(crate) source: TableSourceRef,
     pub(crate) on: Condition,
 }
 

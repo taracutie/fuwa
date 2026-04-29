@@ -4,7 +4,9 @@ use std::ops::{Add, Div, Mul, Not, Sub};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::{BindParam, Field, NotNull, NullabilityOutput, Nullable, Table};
+use crate::{
+    BindParam, Field, NotNull, NotSingleColumn, NullabilityOutput, Nullable, SelectQuery, Table,
+};
 
 /// Reference to a field in the AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -227,7 +229,7 @@ pub enum ExprNode {
     },
     In {
         expr: Box<ExprNode>,
-        list: Vec<ExprNode>,
+        operand: InOperandNode,
         negated: bool,
     },
     Between {
@@ -254,6 +256,32 @@ pub enum ExprNode {
         else_expr: Option<Box<ExprNode>>,
     },
     Star,
+}
+
+/// Runtime operand for an `IN` or `NOT IN` predicate.
+#[derive(Debug)]
+pub struct InOperandNode {
+    pub(crate) kind: InOperandKind,
+}
+
+#[derive(Debug)]
+pub(crate) enum InOperandKind {
+    List(Vec<ExprNode>),
+    Subquery(Box<SelectQuery<(), NotSingleColumn>>),
+}
+
+impl InOperandNode {
+    fn list(list: Vec<ExprNode>) -> Self {
+        Self {
+            kind: InOperandKind::List(list),
+        }
+    }
+
+    fn subquery<R, S>(query: SelectQuery<R, S>) -> Self {
+        Self {
+            kind: InOperandKind::Subquery(Box::new(query.erase_record())),
+        }
+    }
 }
 
 /// A typed SQL expression.
@@ -317,20 +345,18 @@ impl<T, N> Expr<T, N> {
         self.compare(BinaryOp::Gte, rhs)
     }
 
-    pub fn in_<I, R>(self, list: I) -> Condition
+    pub fn in_<I>(self, operand: I) -> Condition
     where
-        I: IntoIterator<Item = R>,
-        R: IntoExpr<T>,
+        I: InOperand<T>,
     {
-        self.in_list(list, false)
+        self.in_operand(operand, false)
     }
 
-    pub fn not_in<I, R>(self, list: I) -> Condition
+    pub fn not_in<I>(self, operand: I) -> Condition
     where
-        I: IntoIterator<Item = R>,
-        R: IntoExpr<T>,
+        I: InOperand<T>,
     {
-        self.in_list(list, true)
+        self.in_operand(operand, true)
     }
 
     pub fn between<L, H>(self, low: L, high: H) -> Condition
@@ -394,18 +420,14 @@ impl<T, N> Expr<T, N> {
         }
     }
 
-    fn in_list<I, R>(self, list: I, negated: bool) -> Condition
+    fn in_operand<I>(self, operand: I, negated: bool) -> Condition
     where
-        I: IntoIterator<Item = R>,
-        R: IntoExpr<T>,
+        I: InOperand<T>,
     {
         Condition {
             node: ExprNode::In {
                 expr: Box::new(self.node),
-                list: list
-                    .into_iter()
-                    .map(|item| item.into_expr().into_node())
-                    .collect(),
+                operand: operand.into_in_operand(),
                 negated,
             },
         }
@@ -558,20 +580,18 @@ impl<T, N> Field<T, N> {
         self.expr().gte(rhs)
     }
 
-    pub fn in_<I, R>(self, list: I) -> Condition
+    pub fn in_<I>(self, operand: I) -> Condition
     where
-        I: IntoIterator<Item = R>,
-        R: IntoExpr<T>,
+        I: InOperand<T>,
     {
-        self.expr().in_(list)
+        self.expr().in_(operand)
     }
 
-    pub fn not_in<I, R>(self, list: I) -> Condition
+    pub fn not_in<I>(self, operand: I) -> Condition
     where
-        I: IntoIterator<Item = R>,
-        R: IntoExpr<T>,
+        I: InOperand<T>,
     {
-        self.expr().not_in(list)
+        self.expr().not_in(operand)
     }
 
     pub fn between<L, H>(self, low: L, high: H) -> Condition
@@ -654,6 +674,72 @@ where
 
     fn into_expr(self) -> Expr<T, Self::Nullability> {
         crate::bind(self)
+    }
+}
+
+/// Something accepted on the right-hand side of `IN` or `NOT IN`.
+///
+/// Subquery operands must select exactly one SQL expression whose SQL type
+/// matches the left-hand expression.
+///
+/// ```compile_fail
+/// use fuwa_core::{Context, Field, NotNull, Table};
+///
+/// let ctx = Context::new();
+/// let users = Table::new("public", "users");
+/// let posts = Table::new("blog", "posts");
+/// let user_email: Field<String, NotNull> = users.field("email");
+/// let post_id: Field<i64, NotNull> = posts.field("id");
+///
+/// let _ = user_email.in_(ctx.select(post_id).from(posts));
+/// ```
+///
+/// ```compile_fail
+/// use fuwa_core::{Context, Field, NotNull, Table};
+///
+/// let ctx = Context::new();
+/// let users = Table::new("public", "users");
+/// let posts = Table::new("blog", "posts");
+/// let user_id: Field<i64, NotNull> = users.field("id");
+/// let post_user_id: Field<i64, NotNull> = posts.field("user_id");
+/// let post_title: Field<String, NotNull> = posts.field("title");
+///
+/// let _ = user_id.in_(ctx.select((post_user_id, post_title)).from(posts));
+/// ```
+pub trait InOperand<T> {
+    #[doc(hidden)]
+    fn into_in_operand(self) -> InOperandNode;
+}
+
+impl<T, R, const N: usize> InOperand<T> for [R; N]
+where
+    R: IntoExpr<T>,
+{
+    fn into_in_operand(self) -> InOperandNode {
+        InOperandNode::list(
+            self.into_iter()
+                .map(|item| item.into_expr().into_node())
+                .collect(),
+        )
+    }
+}
+
+impl<T, R> InOperand<T> for Vec<R>
+where
+    R: IntoExpr<T>,
+{
+    fn into_in_operand(self) -> InOperandNode {
+        InOperandNode::list(
+            self.into_iter()
+                .map(|item| item.into_expr().into_node())
+                .collect(),
+        )
+    }
+}
+
+impl<T, R> InOperand<T> for SelectQuery<R, T> {
+    fn into_in_operand(self) -> InOperandNode {
+        InOperandNode::subquery(self)
     }
 }
 

@@ -21,9 +21,16 @@ pub struct SelectItem {
     pub(crate) expr: crate::ExprNode,
 }
 
+/// Marker used for selections that are not a single SQL expression.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum NotSingleColumn {}
+
 /// Something that can appear in a `select(...)` or `returning(...)` list.
 pub trait Selectable {
     type Record;
+    #[doc(hidden)]
+    type SingleSql;
 
     fn into_select_items(self) -> Vec<SelectItem>;
 }
@@ -33,6 +40,7 @@ where
     N: NullabilityOutput<T>,
 {
     type Record = <N as NullabilityOutput<T>>::Output;
+    type SingleSql = T;
 
     fn into_select_items(self) -> Vec<SelectItem> {
         vec![SelectItem {
@@ -46,6 +54,7 @@ where
     N: NullabilityOutput<T>,
 {
     type Record = <N as NullabilityOutput<T>>::Output;
+    type SingleSql = T;
 
     fn into_select_items(self) -> Vec<SelectItem> {
         vec![SelectItem {
@@ -74,19 +83,38 @@ where
     S: Selectable,
 {
     type Record = R;
+    type SingleSql = S::SingleSql;
 
     fn into_select_items(self) -> Vec<SelectItem> {
         self.selection.into_select_items()
     }
 }
 
-macro_rules! impl_tuple_selectable {
+macro_rules! impl_single_tuple_selectable {
+    ($ty:ident $var:ident) => {
+        impl<$ty> Selectable for ($ty,)
+        where
+            $ty: Selectable,
+        {
+            type Record = ($ty::Record,);
+            type SingleSql = $ty::SingleSql;
+
+            fn into_select_items(self) -> Vec<SelectItem> {
+                let ($var,) = self;
+                $var.into_select_items()
+            }
+        }
+    };
+}
+
+macro_rules! impl_multi_tuple_selectable {
     ($($ty:ident $var:ident),+ $(,)?) => {
         impl<$($ty),+> Selectable for ($($ty,)+)
         where
             $($ty: Selectable),+
         {
             type Record = ($($ty::Record,)+);
+            type SingleSql = NotSingleColumn;
 
             fn into_select_items(self) -> Vec<SelectItem> {
                 let ($($var,)+) = self;
@@ -100,11 +128,11 @@ macro_rules! impl_tuple_selectable {
     };
 }
 
-impl_tuple_selectable!(A a);
-impl_tuple_selectable!(A a, B b);
-impl_tuple_selectable!(A a, B b, C c);
-impl_tuple_selectable!(A a, B b, C c, D d);
-impl_tuple_selectable!(A a, B b, C c, D d, E e);
-impl_tuple_selectable!(A a, B b, C c, D d, E e, F f);
-impl_tuple_selectable!(A a, B b, C c, D d, E e, F f, G g);
-impl_tuple_selectable!(A a, B b, C c, D d, E e, F f, G g, H h);
+impl_single_tuple_selectable!(A a);
+impl_multi_tuple_selectable!(A a, B b);
+impl_multi_tuple_selectable!(A a, B b, C c);
+impl_multi_tuple_selectable!(A a, B b, C c, D d);
+impl_multi_tuple_selectable!(A a, B b, C c, D d, E e);
+impl_multi_tuple_selectable!(A a, B b, C c, D d, E e, F f);
+impl_multi_tuple_selectable!(A a, B b, C c, D d, E e, F f, G g);
+impl_multi_tuple_selectable!(A a, B b, C c, D d, E e, F f, G g, H h);

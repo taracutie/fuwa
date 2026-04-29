@@ -935,6 +935,7 @@ fn render_all_function(source: &mut String, table: &TableDef) {
     source.push_str("pub struct All;\n\n");
     source.push_str("impl Selectable for All {\n");
     source.push_str("type Record = Record;\n\n");
+    source.push_str("type SingleSql = NotSingleColumn;\n\n");
     source.push_str("fn into_select_items(self) -> Vec<fuwa::SelectItem> {\n");
     source.push_str("let mut items = Vec::new();\n");
     for column in &table.columns {

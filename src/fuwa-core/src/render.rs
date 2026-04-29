@@ -1,10 +1,12 @@
 use postgres_types::ToSql;
 
+use crate::expr::InOperandKind;
 use crate::query::{InsertConflict, SelectDistinct};
+use crate::table::TableSourceKind;
 use crate::{
     quote_ident, ArithmeticOp, Assignment, BinaryOp, BindValue, DeleteQuery, Error, ExprNode,
     FieldRef, InsertQuery, Join, JoinKind, OrderDirection, OrderExpr, Result, SelectItem,
-    SelectQuery, Table, UnaryOp, UpdateQuery,
+    SelectQuery, Table, TableSourceRef, UnaryOp, UpdateQuery,
 };
 
 /// A rendered SQL statement plus owned bind values.
@@ -63,7 +65,7 @@ impl Renderer {
     }
 }
 
-impl<R> RenderQuery for SelectQuery<R> {
+impl<R, S> RenderQuery for SelectQuery<R, S> {
     fn render(self) -> Result<RenderedQuery> {
         let mut renderer = Renderer::default();
         render_select(self, &mut renderer)?;
@@ -95,7 +97,7 @@ impl<R> RenderQuery for DeleteQuery<R> {
     }
 }
 
-fn render_select<R>(query: SelectQuery<R>, renderer: &mut Renderer) -> Result<()> {
+fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Result<()> {
     if query.selection.is_empty() {
         return Err(Error::invalid_query_shape(
             "SELECT requires at least one item",
@@ -103,7 +105,21 @@ fn render_select<R>(query: SelectQuery<R>, renderer: &mut Renderer) -> Result<()
     }
     let from = query
         .from
-        .ok_or_else(|| Error::invalid_query_shape("SELECT requires a FROM table"))?;
+        .ok_or_else(|| Error::invalid_query_shape("SELECT requires a FROM source"))?;
+
+    if !query.ctes.is_empty() {
+        renderer.sql.push_str("with ");
+        for (index, cte) in query.ctes.into_iter().enumerate() {
+            if index > 0 {
+                renderer.sql.push_str(", ");
+            }
+            renderer.sql.push_str(&quote_ident(cte.name)?);
+            renderer.sql.push_str(" as (");
+            render_select(cte.query, renderer)?;
+            renderer.sql.push(')');
+        }
+        renderer.sql.push(' ');
+    }
 
     renderer.sql.push_str("select ");
     if let Some(distinct) = query.distinct {
@@ -111,7 +127,7 @@ fn render_select<R>(query: SelectQuery<R>, renderer: &mut Renderer) -> Result<()
     }
     render_select_items(query.selection, renderer, FieldQualification::Qualified)?;
     renderer.sql.push_str(" from ");
-    render_table(from, renderer)?;
+    render_table_source(from, renderer)?;
 
     for join in query.joins {
         render_join(join, renderer)?;
@@ -445,7 +461,7 @@ fn render_join(join: Join, renderer: &mut Renderer) -> Result<()> {
         JoinKind::Inner => renderer.sql.push_str("join "),
         JoinKind::Left => renderer.sql.push_str("left join "),
     }
-    render_table(join.table, renderer)?;
+    render_table_source(join.source, renderer)?;
     renderer.sql.push_str(" on ");
     render_expr(join.on.into_node(), renderer, FieldQualification::Qualified)
 }
@@ -478,6 +494,19 @@ fn render_table(table: Table, renderer: &mut Renderer) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn render_table_source(source: TableSourceRef, renderer: &mut Renderer) -> Result<()> {
+    match source.kind {
+        TableSourceKind::Table(table) => render_table(table, renderer),
+        TableSourceKind::Subquery(subquery) => {
+            renderer.sql.push('(');
+            render_select(*subquery.query, renderer)?;
+            renderer.sql.push_str(") as ");
+            renderer.sql.push_str(&quote_ident(subquery.alias)?);
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -606,29 +635,48 @@ fn render_expr_with_context(
         }
         ExprNode::In {
             expr,
-            list,
+            operand,
             negated,
         } => {
-            if list.is_empty() {
-                return Err(Error::invalid_query_shape(
-                    "IN predicate requires at least one list item",
-                ));
-            }
-
             renderer.sql.push('(');
             render_expr_with_context(*expr, renderer, context)?;
-            if negated {
-                renderer.sql.push_str(" not in (");
-            } else {
-                renderer.sql.push_str(" in (");
-            }
-            for (index, item) in list.into_iter().enumerate() {
-                if index > 0 {
-                    renderer.sql.push_str(", ");
+            match operand.kind {
+                InOperandKind::List(list) => {
+                    if list.is_empty() {
+                        return Err(Error::invalid_query_shape(
+                            "IN predicate requires at least one list item",
+                        ));
+                    }
+
+                    if negated {
+                        renderer.sql.push_str(" not in (");
+                    } else {
+                        renderer.sql.push_str(" in (");
+                    }
+                    for (index, item) in list.into_iter().enumerate() {
+                        if index > 0 {
+                            renderer.sql.push_str(", ");
+                        }
+                        render_expr_with_context(item, renderer, context)?;
+                    }
+                    renderer.sql.push_str("))");
                 }
-                render_expr_with_context(item, renderer, context)?;
+                InOperandKind::Subquery(query) => {
+                    if query.selection.len() != 1 {
+                        return Err(Error::invalid_query_shape(
+                            "IN subquery requires exactly one selected item",
+                        ));
+                    }
+
+                    if negated {
+                        renderer.sql.push_str(" not in (");
+                    } else {
+                        renderer.sql.push_str(" in (");
+                    }
+                    render_select(*query, renderer)?;
+                    renderer.sql.push_str("))");
+                }
             }
-            renderer.sql.push_str("))");
             Ok(())
         }
         ExprNode::Between {
@@ -905,6 +953,135 @@ mod tests {
                 r#"where ("posts"."id" > $1)"#
             )
         );
+    }
+
+    #[test]
+    fn renders_select_with_cte_and_outer_binds() {
+        let active_users = Table::unqualified("active_users");
+        let active_user_id = active_users.field::<i64, NotNull>("id");
+        let active_user_email = active_users.field::<String, NotNull>("email");
+
+        let cte = Context::new()
+            .select((users::id, users::email))
+            .from(users::table)
+            .where_(users::active.eq(bind(true)));
+
+        let query = Context::new()
+            .with("active_users", cte)
+            .select((active_user_id, active_user_email))
+            .from(active_users)
+            .where_(active_user_id.gt(bind(10_i64)))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"with "active_users" as (select "users"."id", "users"."email" "#,
+                r#"from "public"."users" where ("users"."active" = $1)) "#,
+                r#"select "active_users"."id", "active_users"."email" "#,
+                r#"from "active_users" where ("active_users"."id" > $2)"#
+            )
+        );
+        assert_eq!(query.binds().len(), 2);
+    }
+
+    #[test]
+    fn renders_chained_ctes_with_left_to_right_binds() {
+        let ranked = Table::unqualified("ranked");
+        let ranked_id = ranked.field::<i64, NotNull>("id");
+        let recent = Table::unqualified("recent");
+        let recent_id = recent.field::<i64, NotNull>("id");
+
+        let ranked_query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::signup_rank.gt(bind(10_i32)));
+        let recent_query = Context::new()
+            .select(ranked_id)
+            .from(ranked)
+            .where_(ranked_id.lt(bind(100_i64)));
+
+        let query = Context::new()
+            .with("ranked", ranked_query)
+            .with("recent", recent_query)
+            .select(recent_id)
+            .from(recent)
+            .where_(recent_id.ne(bind(7_i64)))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"with "ranked" as (select "users"."id" from "public"."users" "#,
+                r#"where ("users"."signup_rank" > $1)), "#,
+                r#""recent" as (select "ranked"."id" from "ranked" "#,
+                r#"where ("ranked"."id" < $2)) "#,
+                r#"select "recent"."id" from "recent" where ("recent"."id" <> $3)"#
+            )
+        );
+        assert_eq!(query.binds().len(), 3);
+    }
+
+    #[test]
+    fn renders_aliased_subquery_as_from_source() {
+        let subquery = Context::new()
+            .select((users::id, users::email))
+            .from(users::table)
+            .where_(users::active.eq(bind(true)))
+            .alias("u");
+        let subquery_id = subquery.field::<i64, NotNull>("id");
+        let subquery_email = subquery.field::<String, NotNull>("email");
+
+        let query = Context::new()
+            .select((subquery_id, subquery_email))
+            .from(subquery)
+            .where_(subquery_id.gt(bind(5_i64)))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "u"."id", "u"."email" from "#,
+                r#"(select "users"."id", "users"."email" from "public"."users" "#,
+                r#"where ("users"."active" = $1)) as "u" "#,
+                r#"where ("u"."id" > $2)"#
+            )
+        );
+        assert_eq!(query.binds().len(), 2);
+    }
+
+    #[test]
+    fn renders_aliased_subquery_as_join_source() {
+        let post_counts = Context::new()
+            .select((posts::user_id, count_star()))
+            .from(posts::table)
+            .group_by(posts::user_id)
+            .having(count_star().gt(bind(1_i64)))
+            .alias("pc");
+        let post_counts_user_id = post_counts.field::<i64, NotNull>("user_id");
+
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .join(post_counts.on(post_counts_user_id.eq(users::id)))
+            .where_(users::active.eq(bind(true)))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id" from "public"."users" join "#,
+                r#"(select "posts"."user_id", count(*) from "blog"."posts" "#,
+                r#"group by "posts"."user_id" having (count(*) > $1)) as "pc" "#,
+                r#"on ("pc"."user_id" = "users"."id") "#,
+                r#"where ("users"."active" = $2)"#
+            )
+        );
+        assert_eq!(query.binds().len(), 2);
     }
 
     #[test]
@@ -1205,6 +1382,43 @@ mod tests {
             )
         );
         assert_eq!(query.binds().len(), 4);
+    }
+
+    #[test]
+    fn renders_in_and_not_in_subqueries() {
+        let matching_posts = Context::new()
+            .select(posts::user_id)
+            .from(posts::table)
+            .where_(posts::id.gt(bind(10_i64)));
+        let blocked_posts = Context::new()
+            .select(posts::user_id)
+            .from(posts::table)
+            .where_(posts::title.ilike(bind("%spam%")));
+
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(
+                users::id
+                    .in_(matching_posts)
+                    .and(users::id.not_in(blocked_posts))
+                    .and(users::active.eq(bind(true))),
+            )
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id" from "public"."users" where "#,
+                r#"((("users"."id" in (select "posts"."user_id" from "blog"."posts" "#,
+                r#"where ("posts"."id" > $1))) and "#,
+                r#"("users"."id" not in (select "posts"."user_id" from "blog"."posts" "#,
+                r#"where ("posts"."title" ilike $2)))) and "#,
+                r#"("users"."active" = $3))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 3);
     }
 
     #[test]

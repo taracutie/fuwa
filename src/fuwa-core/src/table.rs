@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::JoinTarget;
+use crate::{JoinTarget, NotSingleColumn, SelectQuery};
 
 /// Marker for non-null SQL expressions and fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,7 +54,7 @@ impl Table {
     /// Attach an `ON` condition for use with `join` or `left_join`.
     pub fn on(self, condition: crate::Condition) -> JoinTarget {
         JoinTarget {
-            table: self,
+            source: self.into_table_source(),
             on: condition,
         }
     }
@@ -73,6 +73,94 @@ impl Table {
 
     pub(crate) fn same_identity(self, other: Self) -> bool {
         self.schema == other.schema && self.name == other.name
+    }
+}
+
+/// A concrete source that can appear in a `FROM` or `JOIN` clause.
+#[derive(Debug)]
+pub struct TableSourceRef {
+    pub(crate) kind: TableSourceKind,
+}
+
+#[derive(Debug)]
+pub(crate) enum TableSourceKind {
+    Table(Table),
+    Subquery(AliasedSubquery),
+}
+
+impl TableSourceRef {
+    pub(crate) const fn table(table: Table) -> Self {
+        Self {
+            kind: TableSourceKind::Table(table),
+        }
+    }
+
+    pub(crate) fn subquery(subquery: AliasedSubquery) -> Self {
+        Self {
+            kind: TableSourceKind::Subquery(subquery),
+        }
+    }
+}
+
+/// Something that can appear in a `FROM` or `JOIN` clause.
+pub trait TableSource {
+    #[doc(hidden)]
+    fn into_table_source(self) -> TableSourceRef;
+
+    /// Attach an `ON` condition for use with `join` or `left_join`.
+    fn on(self, condition: crate::Condition) -> JoinTarget
+    where
+        Self: Sized,
+    {
+        JoinTarget {
+            source: self.into_table_source(),
+            on: condition,
+        }
+    }
+}
+
+impl TableSource for Table {
+    fn into_table_source(self) -> TableSourceRef {
+        TableSourceRef::table(self)
+    }
+}
+
+/// A `SELECT` query aliased for use as a `FROM` or `JOIN` source.
+#[derive(Debug)]
+pub struct AliasedSubquery {
+    pub(crate) query: Box<SelectQuery<(), NotSingleColumn>>,
+    pub(crate) alias: &'static str,
+}
+
+impl AliasedSubquery {
+    pub(crate) fn new<R, S>(query: SelectQuery<R, S>, alias: &'static str) -> Self {
+        Self {
+            query: Box::new(query.erase_record()),
+            alias,
+        }
+    }
+
+    /// Create a typed field attached to this subquery alias.
+    pub fn field<T, N>(&self, name: &'static str) -> Field<T, N> {
+        Table::unqualified(self.alias).field(name)
+    }
+
+    /// Attach an `ON` condition for use with `join` or `left_join`.
+    pub fn on(self, condition: crate::Condition) -> JoinTarget {
+        JoinTarget {
+            source: self.into_table_source(),
+            on: condition,
+        }
+    }
+
+    pub const fn alias(&self) -> &'static str {
+        self.alias
+    }
+}
+
+impl TableSource for AliasedSubquery {
+    fn into_table_source(self) -> TableSourceRef {
+        TableSourceRef::subquery(self)
     }
 }
 
