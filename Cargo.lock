@@ -473,6 +473,8 @@ name = "fuwa-postgres"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures-core",
+ "futures-util",
  "fuwa-core",
  "fuwa-derive",
  "rust_decimal",

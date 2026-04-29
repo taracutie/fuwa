@@ -526,6 +526,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## postgres streaming
+
+`fetch_stream` and `fetch_chunked` use PostgreSQL portals for server-side
+streaming. Portals only live for the duration of a transaction, so pass an
+open transaction and keep it alive until the stream is exhausted or dropped:
+
+```rust
+use futures_util::StreamExt;
+use fuwa::prelude::*;
+
+async fn stream_example(
+    client: &mut tokio_postgres::Client,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tx = client.transaction().await?;
+
+    {
+        let mut chunks = raw("select id, email from users order by id")
+            .fetch_chunked::<(i64, String)>(500, &tx)
+            .await?;
+
+        while let Some(chunk) = chunks.next().await {
+            for (id, email) in chunk? {
+                println!("{id}: {email}");
+            }
+        }
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+```
+
 ## raw SQL escape hatch
 
 for SQL the typed DSL doesnt cover yet, you can drop into raw SQL with separate bind values:

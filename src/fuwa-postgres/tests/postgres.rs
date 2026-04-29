@@ -1,5 +1,6 @@
 extern crate fuwa_postgres as fuwa;
 
+use futures_util::StreamExt;
 use fuwa_core::prelude::*;
 use fuwa_derive::FromRow;
 use fuwa_postgres::{transaction, PgQueryExt};
@@ -356,6 +357,102 @@ async fn derive_from_row_decodes_custom_struct_by_column_name_when_database_url_
 
     client
         .batch_execute("drop table if exists public.fuwa_test_derive_accounts;")
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_stream_and_chunked_use_postgres_portals_when_database_url_is_set() -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!(
+            "skipping PostgreSQL streaming integration test: FUWA_TEST_DATABASE_URL is not set"
+        );
+        return Ok(());
+    };
+
+    let (mut client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("PostgreSQL connection task failed: {err}");
+        }
+    });
+
+    client
+        .batch_execute(
+            r#"
+            drop table if exists public.fuwa_test_stream_rows;
+            create table public.fuwa_test_stream_rows (
+                id bigint primary key,
+                label text not null
+            );
+
+            insert into public.fuwa_test_stream_rows (id, label)
+            select value, 'stream-' || value::text
+            from generate_series(1, 10000) as value;
+            "#,
+        )
+        .await?;
+
+    let tx = client.transaction().await?;
+    let mut rows = raw(r#"
+        select id, label
+        from public.fuwa_test_stream_rows
+        order by id
+        "#)
+    .fetch_stream::<(i64, String)>(&tx)
+    .await?;
+
+    let mut count = 0_i64;
+    while let Some(row) = rows.next().await {
+        let (id, label) = row?;
+        count += 1;
+
+        assert_eq!(id, count);
+        assert_eq!(label, format!("stream-{count}"));
+    }
+    assert_eq!(count, 10_000);
+    drop(rows);
+    tx.commit().await?;
+
+    let tx = client.transaction().await?;
+    let mut chunks = raw(r#"
+        select id, label
+        from public.fuwa_test_stream_rows
+        order by id
+        "#)
+    .fetch_chunked::<(i64, String)>(777, &tx)
+    .await?;
+
+    let mut total = 0_i64;
+    let mut chunk_count = 0_usize;
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        chunk_count += 1;
+
+        let chunk_len = chunk.len();
+
+        if total + (chunk_len as i64) < 10_000 {
+            assert_eq!(chunk.len(), 777);
+        } else {
+            assert_eq!(chunk.len(), 676);
+        }
+
+        for (offset, (id, label)) in chunk.into_iter().enumerate() {
+            let expected = total + offset as i64 + 1;
+            assert_eq!(id, expected);
+            assert_eq!(label, format!("stream-{expected}"));
+        }
+
+        total += chunk_len as i64;
+    }
+    assert_eq!(total, 10_000);
+    assert_eq!(chunk_count, 13);
+    drop(chunks);
+    tx.commit().await?;
+
+    client
+        .batch_execute("drop table if exists public.fuwa_test_stream_rows;")
         .await?;
 
     Ok(())

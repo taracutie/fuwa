@@ -14,7 +14,9 @@
 
 pub use fuwa_core::*;
 pub use fuwa_derive::FromRow;
-pub use fuwa_postgres::{transaction, FromRow, PgFuture, PgQueryExt, Row, TransactionFuture};
+pub use fuwa_postgres::{
+    transaction, FromRow, PgFuture, PgQueryExt, PgStream, Row, TransactionFuture,
+};
 
 /// Re-exported external types used by generated schema modules.
 pub mod types {
@@ -27,7 +29,7 @@ pub mod types {
 /// PostgreSQL-specific execution exports.
 pub mod postgres {
     pub use fuwa_postgres::{
-        transaction, types, FromRow, PgFuture, PgQueryExt, Row, TransactionFuture,
+        transaction, types, FromRow, PgFuture, PgQueryExt, PgStream, Row, TransactionFuture,
     };
 }
 
@@ -35,5 +37,5 @@ pub mod postgres {
 pub mod prelude {
     pub use fuwa_core::prelude::*;
     pub use fuwa_derive::FromRow;
-    pub use fuwa_postgres::{transaction, FromRow, PgQueryExt, TransactionFuture};
+    pub use fuwa_postgres::{transaction, FromRow, PgQueryExt, PgStream, TransactionFuture};
 }
