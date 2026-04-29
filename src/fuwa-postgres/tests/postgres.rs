@@ -3,7 +3,7 @@ extern crate fuwa_postgres as fuwa;
 use futures_util::StreamExt;
 use fuwa_core::prelude::*;
 use fuwa_derive::FromRow;
-use fuwa_postgres::{transaction, PgQueryExt};
+use fuwa_postgres::Dsl;
 use rust_decimal::Decimal;
 use tokio_postgres::NoTls;
 
@@ -101,47 +101,47 @@ async fn postgres_round_trip_when_database_url_is_set() -> TestResult {
         )
         .await?;
 
-    let ctx = Context::new();
+    let dsl = Dsl::using(&client);
 
-    let inserted_id = ctx
+    let inserted_id = dsl
         .insert_into(users::table)
         .values((
             users::email.set(bind("a@example.com")),
             users::active.set(bind(true)),
         ))
         .returning(users::id)
-        .fetch_one::<i64>(&client)
+        .fetch_one::<i64>()
         .await?;
 
-    let rows = ctx
+    let rows = dsl
         .select((users::id, users::email))
         .from(users::table)
         .where_(users::id.eq(bind(inserted_id)))
-        .fetch_all::<(i64, String)>(&client)
+        .fetch_all::<(i64, String)>()
         .await?;
     assert_eq!(rows, vec![(inserted_id, "a@example.com".to_owned())]);
 
-    let missing = ctx
+    let missing = dsl
         .select(users::id)
         .from(users::table)
         .where_(users::email.eq(bind("missing@example.com")))
-        .fetch_optional::<i64>(&client)
+        .fetch_optional::<i64>()
         .await?;
     assert_eq!(missing, None);
 
-    let updated = ctx
+    let updated = dsl
         .update(users::table)
         .set(users::email.set(bind("new@example.com")))
         .where_(users::id.eq(bind(inserted_id)))
         .returning(users::email)
-        .fetch_one::<String>(&client)
+        .fetch_one::<String>()
         .await?;
     assert_eq!(updated, "new@example.com");
 
-    let deleted = ctx
+    let deleted = dsl
         .delete_from(users::table)
         .where_(users::id.eq(bind(inserted_id)))
-        .execute(&client)
+        .execute()
         .await?;
     assert_eq!(deleted, 1);
 
@@ -180,9 +180,9 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
         )
         .await?;
 
-    let ctx = Context::new();
+    let dsl = Dsl::using(&client);
 
-    let inserted = ctx
+    let inserted = dsl
         .insert_into(upsert_users::table)
         .values_many([
             (
@@ -198,15 +198,15 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
                 upsert_users::active.set(bind(false)),
             ),
         ])
-        .execute(&client)
+        .execute()
         .await?;
     assert_eq!(inserted, 2);
 
-    let rows = ctx
+    let rows = dsl
         .select((upsert_users::id, upsert_users::email))
         .from(upsert_users::table)
         .order_by(upsert_users::id.asc())
-        .fetch_all::<(i64, String)>(&client)
+        .fetch_all::<(i64, String)>()
         .await?;
     assert_eq!(
         rows,
@@ -216,7 +216,7 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
         ]
     );
 
-    let ignored = ctx
+    let ignored = dsl
         .insert_into(upsert_users::table)
         .values((
             upsert_users::id.set(bind(3_i64)),
@@ -227,19 +227,19 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
         .on_conflict((upsert_users::email,))
         .do_nothing()
         .returning(upsert_users::id)
-        .fetch_optional::<i64>(&client)
+        .fetch_optional::<i64>()
         .await?;
     assert_eq!(ignored, None);
 
-    let unchanged = ctx
+    let unchanged = dsl
         .select((upsert_users::display_name, upsert_users::active))
         .from(upsert_users::table)
         .where_(upsert_users::email.eq(bind("ada@example.com")))
-        .fetch_one::<(Option<String>, bool)>(&client)
+        .fetch_one::<(Option<String>, bool)>()
         .await?;
     assert_eq!(unchanged, (Some("Ada".to_owned()), true));
 
-    let updated = ctx
+    let updated = dsl
         .insert_into(upsert_users::table)
         .values((
             upsert_users::id.set(bind(4_i64)),
@@ -259,43 +259,78 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
             upsert_users::display_name,
             upsert_users::active,
         ))
-        .fetch_one::<(i64, Option<String>, bool)>(&client)
+        .fetch_one::<(i64, Option<String>, bool)>()
         .await?;
     assert_eq!(updated, (2, Some("Benedict".to_owned()), true));
+    drop(dsl);
 
-    let tx_result = transaction(&mut client, |tx| {
-        Box::pin(async move {
-            ctx.insert_into(upsert_users::table)
-                .values((
-                    upsert_users::id.set(bind(5_i64)),
-                    upsert_users::email.set(bind("rolled-back@example.com")),
-                    upsert_users::display_name.set(bind(Some("Rollback"))),
-                    upsert_users::active.set(bind(true)),
-                ))
-                .execute(tx)
-                .await?;
-
-            ctx.insert_into(upsert_users::table)
-                .values((
-                    upsert_users::id.set(bind(1_i64)),
-                    upsert_users::email.set(bind("duplicate-id@example.com")),
-                    upsert_users::display_name.set(bind(None::<String>)),
-                    upsert_users::active.set(bind(true)),
-                ))
-                .execute(tx)
-                .await?;
-
-            Ok(())
+    let mut dsl = Dsl::using(&mut client);
+    let committed_id = dsl
+        .transaction(|tx| {
+            Box::pin(async move {
+                tx.insert_into(upsert_users::table)
+                    .values((
+                        upsert_users::id.set(bind(5_i64)),
+                        upsert_users::email.set(bind("committed@example.com")),
+                        upsert_users::display_name.set(bind(Some("Committed"))),
+                        upsert_users::active.set(bind(true)),
+                    ))
+                    .returning(upsert_users::id)
+                    .fetch_one::<i64>()
+                    .await
+            })
         })
-    })
-    .await;
-    assert!(tx_result.is_err());
+        .await?;
+    assert_eq!(committed_id, 5);
+    drop(dsl);
 
-    let rolled_back_count = ctx
+    let dsl = Dsl::using(&client);
+    let committed_count = dsl
+        .select(count_star())
+        .from(upsert_users::table)
+        .where_(upsert_users::email.eq(bind("committed@example.com")))
+        .fetch_one::<i64>()
+        .await?;
+    assert_eq!(committed_count, 1);
+    drop(dsl);
+
+    let mut dsl = Dsl::using(&mut client);
+    let tx_result = dsl
+        .transaction(|tx| {
+            Box::pin(async move {
+                tx.insert_into(upsert_users::table)
+                    .values((
+                        upsert_users::id.set(bind(6_i64)),
+                        upsert_users::email.set(bind("rolled-back@example.com")),
+                        upsert_users::display_name.set(bind(Some("Rollback"))),
+                        upsert_users::active.set(bind(true)),
+                    ))
+                    .execute()
+                    .await?;
+
+                tx.insert_into(upsert_users::table)
+                    .values((
+                        upsert_users::id.set(bind(1_i64)),
+                        upsert_users::email.set(bind("duplicate-id@example.com")),
+                        upsert_users::display_name.set(bind(None::<String>)),
+                        upsert_users::active.set(bind(true)),
+                    ))
+                    .execute()
+                    .await?;
+
+                Ok(())
+            })
+        })
+        .await;
+    assert!(tx_result.is_err());
+    drop(dsl);
+
+    let dsl = Dsl::using(&client);
+    let rolled_back_count = dsl
         .select(count_star())
         .from(upsert_users::table)
         .where_(upsert_users::email.eq(bind("rolled-back@example.com")))
-        .fetch_one::<i64>(&client)
+        .fetch_one::<i64>()
         .await?;
     assert_eq!(rolled_back_count, 0);
 
@@ -337,14 +372,18 @@ async fn derive_from_row_decodes_custom_struct_by_column_name_when_database_url_
         )
         .await?;
 
-    let account = raw(r#"
+    let dsl = Dsl::using(&client);
+    let account = dsl
+        .raw(
+            r#"
         select display_name, email, id
         from public.fuwa_test_derive_accounts
         where id = $1
-        "#)
-    .bind(1_i64)
-    .fetch_one::<DerivedAccount>(&client)
-    .await?;
+        "#,
+        )
+        .bind(1_i64)
+        .fetch_one::<DerivedAccount>()
+        .await?;
 
     assert_eq!(
         account,
@@ -395,13 +434,17 @@ async fn fetch_stream_and_chunked_use_postgres_portals_when_database_url_is_set(
         .await?;
 
     let tx = client.transaction().await?;
-    let mut rows = raw(r#"
+    let dsl = Dsl::using(&tx);
+    let mut rows = dsl
+        .raw(
+            r#"
         select id, label
         from public.fuwa_test_stream_rows
         order by id
-        "#)
-    .fetch_stream::<(i64, String)>(&tx)
-    .await?;
+        "#,
+        )
+        .fetch_stream::<(i64, String)>()
+        .await?;
 
     let mut count = 0_i64;
     while let Some(row) = rows.next().await {
@@ -413,16 +456,21 @@ async fn fetch_stream_and_chunked_use_postgres_portals_when_database_url_is_set(
     }
     assert_eq!(count, 10_000);
     drop(rows);
+    drop(dsl);
     tx.commit().await?;
 
     let tx = client.transaction().await?;
-    let mut chunks = raw(r#"
+    let dsl = Dsl::using(&tx);
+    let mut chunks = dsl
+        .raw(
+            r#"
         select id, label
         from public.fuwa_test_stream_rows
         order by id
-        "#)
-    .fetch_chunked::<(i64, String)>(777, &tx)
-    .await?;
+        "#,
+        )
+        .fetch_chunked::<(i64, String)>(777)
+        .await?;
 
     let mut total = 0_i64;
     let mut chunk_count = 0_usize;
@@ -449,6 +497,7 @@ async fn fetch_stream_and_chunked_use_postgres_portals_when_database_url_is_set(
     assert_eq!(total, 10_000);
     assert_eq!(chunk_count, 13);
     drop(chunks);
+    drop(dsl);
     tx.commit().await?;
 
     client
@@ -536,9 +585,9 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         )
         .await?;
 
-    let ctx = Context::new();
+    let dsl = Dsl::using(&client);
 
-    let published_for_active_accounts = ctx
+    let published_for_active_accounts = dsl
         .select((accounts::email, posts::title, posts::score))
         .from(accounts::table)
         .join(posts::table.on(posts::account_id.eq(accounts::id)))
@@ -548,7 +597,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
                 .and(posts::published.eq(bind(true))),
         )
         .order_by((accounts::id.asc(), posts::id.asc()))
-        .fetch_all::<(String, String, i32)>(&client)
+        .fetch_all::<(String, String, i32)>()
         .await?;
 
     assert_eq!(
@@ -559,7 +608,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         ]
     );
 
-    let active_accounts_with_optional_published_posts = ctx
+    let active_accounts_with_optional_published_posts = dsl
         .select((accounts::email, nullable(posts::title)))
         .from(accounts::table)
         .left_join(
@@ -569,7 +618,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         )
         .where_(accounts::active.eq(bind(true)))
         .order_by(accounts::id.asc())
-        .fetch_all::<(String, Option<String>)>(&client)
+        .fetch_all::<(String, Option<String>)>()
         .await?;
 
     assert_eq!(
@@ -581,12 +630,12 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         ]
     );
 
-    let accounts_without_display_name = ctx
+    let accounts_without_display_name = dsl
         .select((accounts::id, accounts::display_name))
         .from(accounts::table)
         .where_(accounts::display_name.is_null())
         .order_by(accounts::id.asc())
-        .fetch_all::<(i64, Option<String>)>(&client)
+        .fetch_all::<(i64, Option<String>)>()
         .await?;
 
     assert_eq!(
@@ -594,12 +643,12 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         vec![(2, None), (3, None), (4, None)]
     );
 
-    let high_rank_accounts = ctx
+    let high_rank_accounts = dsl
         .select(accounts::email)
         .from(accounts::table)
         .where_(accounts::signup_rank.gte(bind(30_i32)))
         .order_by(accounts::signup_rank.desc())
-        .fetch_all::<String>(&client)
+        .fetch_all::<String>()
         .await?;
 
     assert_eq!(
@@ -607,25 +656,25 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         vec!["dana@example.com".to_owned(), "cy@example.com".to_owned()]
     );
 
-    let ada_balance = ctx
+    let ada_balance = dsl
         .select(accounts::account_balance)
         .from(accounts::table)
         .where_(accounts::email.eq(bind("ada@example.com")))
-        .fetch_one::<Decimal>(&client)
+        .fetch_one::<Decimal>()
         .await?;
 
     assert_eq!(ada_balance, Decimal::new(1025, 2));
 
-    let active_balance_total = ctx
+    let active_balance_total = dsl
         .select(sum(accounts::account_balance))
         .from(accounts::table)
         .where_(accounts::active.eq(bind(true)))
-        .fetch_one::<Option<Decimal>>(&client)
+        .fetch_one::<Option<Decimal>>()
         .await?;
 
     assert_eq!(active_balance_total, Some(Decimal::new(8050, 2)));
 
-    let filtered_accounts = ctx
+    let filtered_accounts = dsl
         .select(accounts::email)
         .from(accounts::table)
         .where_(
@@ -636,7 +685,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
                 .and(accounts::signup_rank.not_between(bind(35_i32), bind(45_i32))),
         )
         .order_by(accounts::id.asc())
-        .fetch_all::<String>(&client)
+        .fetch_all::<String>()
         .await?;
 
     assert_eq!(
@@ -644,17 +693,17 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         vec!["ada@example.com".to_owned(), "cy@example.com".to_owned()]
     );
 
-    let adjusted_scores = ctx
+    let adjusted_scores = dsl
         .select((posts::id, posts::score.expr() + bind(8_i32)))
         .from(posts::table)
         .where_(posts::id.in_([bind(10_i64), bind(30_i64)]))
         .order_by(posts::id.asc())
-        .fetch_all::<(i64, i32)>(&client)
+        .fetch_all::<(i64, i32)>()
         .await?;
 
     assert_eq!(adjusted_scores, vec![(10, 50), (30, 85)]);
 
-    let account_labels = ctx
+    let account_labels = dsl
         .select((
             accounts::id,
             concat(
@@ -669,7 +718,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .from(accounts::table)
         .where_(accounts::id.in_([bind(1_i64), bind(2_i64)]))
         .order_by(accounts::id.asc())
-        .fetch_all::<(i64, String, Option<String>, String)>(&client)
+        .fetch_all::<(i64, String, Option<String>, String)>()
         .await?;
 
     assert_eq!(
@@ -685,7 +734,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         ]
     );
 
-    let inserted_balance = ctx
+    let inserted_balance = dsl
         .insert_into(accounts::table)
         .values((
             accounts::id.set(bind(5_i64)),
@@ -696,42 +745,42 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
             accounts::account_balance.set(bind(Decimal::new(5050, 2))),
         ))
         .returning(accounts::account_balance)
-        .fetch_one::<Decimal>(&client)
+        .fetch_one::<Decimal>()
         .await?;
 
     assert_eq!(inserted_balance, Decimal::new(5050, 2));
 
-    let posts_without_body = ctx
+    let posts_without_body = dsl
         .select((posts::id, posts::body))
         .from(posts::table)
         .where_(posts::body.is_null())
         .order_by(posts::id.asc())
-        .fetch_all::<(i64, Option<String>)>(&client)
+        .fetch_all::<(i64, Option<String>)>()
         .await?;
 
     assert_eq!(posts_without_body, vec![(11, None), (30, None)]);
 
-    let published_post_count = ctx
+    let published_post_count = dsl
         .select(count_star())
         .from(posts::table)
         .where_(posts::published.eq(bind(true)))
-        .fetch_one::<i64>(&client)
+        .fetch_one::<i64>()
         .await?;
 
     assert_eq!(published_post_count, 3);
 
-    let post_counts_by_account = ctx
+    let post_counts_by_account = dsl
         .select((posts::account_id, count_star()))
         .from(posts::table)
         .group_by(posts::account_id)
         .having(count_star().gt(bind(1_i64)))
         .order_by(posts::account_id.asc())
-        .fetch_all::<(i64, i64)>(&client)
+        .fetch_all::<(i64, i64)>()
         .await?;
 
     assert_eq!(post_counts_by_account, vec![(1, 2)]);
 
-    let inserted_comment = ctx
+    let inserted_comment = dsl
         .insert_into(comments::table)
         .values((
             comments::id.set(bind(301_i64)),
@@ -739,59 +788,65 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
             comments::body.set(bind("late addition")),
         ))
         .returning((comments::id, comments::body))
-        .fetch_one::<(i64, String)>(&client)
+        .fetch_one::<(i64, String)>()
         .await?;
 
     assert_eq!(inserted_comment, (301, "late addition".to_owned()));
 
-    let updated_post = ctx
+    let updated_post = dsl
         .update(posts::table)
         .set(posts::score.set(bind(100_i32)))
         .where_(posts::id.eq(bind(10_i64)))
         .returning((posts::id, posts::score))
-        .fetch_one::<(i64, i32)>(&client)
+        .fetch_one::<(i64, i32)>()
         .await?;
 
     assert_eq!(updated_post, (10, 100));
 
-    let deleted_draft_comments = ctx
+    let deleted_draft_comments = dsl
         .delete_from(comments::table)
         .where_(comments::post_id.eq(bind(11_i64)))
-        .execute(&client)
+        .execute()
         .await?;
 
     assert_eq!(deleted_draft_comments, 1);
 
-    let remaining_comment_count = ctx
+    let remaining_comment_count = dsl
         .select(count_star())
         .from(comments::table)
-        .fetch_one::<i64>(&client)
+        .fetch_one::<i64>()
         .await?;
 
     assert_eq!(remaining_comment_count, 4);
 
-    let recent_images = raw(r#"select "recentImages"
+    let recent_images = dsl
+        .raw(
+            r#"select "recentImages"
            from fuwa_it_complex.recent_buffers
-           where "userId" = $1"#)
-    .bind("ada")
-    .fetch_one::<Vec<String>>(&client)
-    .await?;
+           where "userId" = $1"#,
+        )
+        .bind("ada")
+        .fetch_one::<Vec<String>>()
+        .await?;
 
     assert_eq!(
         recent_images,
         vec!["img-a.jpg".to_owned(), "img-b.jpg".to_owned()]
     );
 
-    let selected_emails = raw(r#"select email
+    let selected_emails = dsl
+        .raw(
+            r#"select email
            from fuwa_it_complex.accounts
            where email = any($1)
-           order by email"#)
-    .bind(vec![
-        "cy@example.com".to_owned(),
-        "ada@example.com".to_owned(),
-    ])
-    .fetch_all::<String>(&client)
-    .await?;
+           order by email"#,
+        )
+        .bind(vec![
+            "cy@example.com".to_owned(),
+            "ada@example.com".to_owned(),
+        ])
+        .fetch_all::<String>()
+        .await?;
 
     assert_eq!(
         selected_emails,

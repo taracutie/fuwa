@@ -177,7 +177,7 @@ fn prisma_schema_generates_compile_checked_module_and_expected_sql() -> TestResu
 
                 #[test]
                 fn renders_prisma_expected_identifiers() {{
-                    let query = Context::new()
+                    let query = fuwa::core::Context::new()
                         .select((users::id, users::role, posts::author_id))
                         .from(users::table)
                         .join(posts::table.on(posts::author_id.eq(users::id)))
@@ -243,8 +243,8 @@ fn prisma_schema_generates_compile_checked_module_and_expected_sql() -> TestResu
                         )
                         .await?;
 
-                    let ctx = Context::new();
-                    let inserted_role = ctx
+                    let dsl = Dsl::using(&client);
+                    let inserted_role = dsl
                         .insert_into(users::table)
                         .values((
                             users::email.set(bind("enum@example.com")),
@@ -252,16 +252,16 @@ fn prisma_schema_generates_compile_checked_module_and_expected_sql() -> TestResu
                             users::role.set(bind(Role::Admin)),
                         ))
                         .returning(users::role)
-                        .fetch_one::<Option<Role>>(&client)
+                        .fetch_one::<Option<Role>>()
                         .await?;
 
                     assert_eq!(inserted_role, Some(Role::Admin));
 
-                    let record = ctx
+                    let record = dsl
                         .select(users::all())
                         .from(users::table)
                         .where_(users::role.eq(bind(Role::Admin)))
-                        .fetch_one::<users::Record>(&client)
+                        .fetch_one::<users::Record>()
                         .await?;
 
                     assert_eq!(record.role, Some(Role::Admin));

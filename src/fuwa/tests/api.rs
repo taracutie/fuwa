@@ -27,7 +27,7 @@ mod root_derive_exports {
 
 #[test]
 fn facade_renders_query() {
-    let rendered = Context::new()
+    let rendered = fuwa::core::Context::new()
         .select((users::id, users::email))
         .from(users::table)
         .where_(users::active.eq(bind(true)))
@@ -42,9 +42,10 @@ fn facade_renders_query() {
 
 #[allow(dead_code)]
 fn fetch_api_shape_compiles(client: &tokio_postgres::Client) {
-    let future = Context::new()
+    let dsl = Dsl::using(client);
+    let future = dsl
         .select((users::id, users::email))
         .from(users::table)
-        .fetch_all::<(i64, String)>(client);
+        .fetch_all::<(i64, String)>();
     drop(future);
 }

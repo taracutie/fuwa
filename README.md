@@ -17,6 +17,15 @@
 with the `fuwa` DSL, queries read almost the same as the SQL they compile to ~
 typed columns, typed bindings, no string concatenation.
 
+the rust snippets below assume a generated schema module is imported and a
+postgres client has been wrapped once:
+
+```rust
+use fuwa::prelude::*;
+
+let dsl = Dsl::using(&client);
+```
+
 ### simple select
 
 ```sql
@@ -28,7 +37,7 @@ limit 20
 ```
 
 ```rust
-ctx.select((users::id, users::email))
+dsl.select((users::id, users::email))
    .from(users::table)
    .where_(users::active.eq(true))
    .order_by(users::created_at.desc())
@@ -47,7 +56,7 @@ order by accounts.id asc, posts.id asc
 ```
 
 ```rust
-ctx.select((accounts::email, posts::title, posts::score))
+dsl.select((accounts::email, posts::title, posts::score))
    .from(accounts::table)
    .join(posts::table.on(posts::account_id.eq(accounts::id)))
    .where_(
@@ -68,7 +77,7 @@ order by account_id asc
 ```
 
 ```rust
-ctx.select((posts::account_id, count_star()))
+dsl.select((posts::account_id, count_star()))
    .from(posts::table)
    .group_by(posts::account_id)
    .having(count_star().gt(1_i64))
@@ -93,9 +102,9 @@ let active_accounts = Table::unqualified("active_accounts");
 let active_id = active_accounts.field::<i64, NotNull>("id");
 let active_email = active_accounts.field::<String, NotNull>("email");
 
-ctx.with(
+dsl.with(
        "active_accounts",
-       ctx.select((accounts::id, accounts::email))
+       dsl.select((accounts::id, accounts::email))
           .from(accounts::table)
           .where_(accounts::active.eq(true)),
    )
@@ -117,7 +126,7 @@ where recent.id > 10
 ```
 
 ```rust
-let recent = ctx
+let recent = dsl
     .select((accounts::id, accounts::email))
     .from(accounts::table)
     .where_(accounts::active.eq(true))
@@ -125,7 +134,7 @@ let recent = ctx
 let recent_id = recent.field::<i64, NotNull>("id");
 let recent_email = recent.field::<String, NotNull>("email");
 
-ctx.select((recent_id, recent_email))
+dsl.select((recent_id, recent_email))
    .from(recent)
    .where_(recent_id.gt(10_i64))
 ```
@@ -145,7 +154,7 @@ where accounts.active = true
 ```
 
 ```rust
-let post_counts = ctx
+let post_counts = dsl
     .select((posts::account_id, count_star()))
     .from(posts::table)
     .group_by(posts::account_id)
@@ -153,7 +162,7 @@ let post_counts = ctx
     .alias("post_counts");
 let post_counts_account_id = post_counts.field::<i64, NotNull>("account_id");
 
-ctx.select((accounts::email, post_counts_account_id))
+dsl.select((accounts::email, post_counts_account_id))
    .from(accounts::table)
    .join(post_counts.on(post_counts_account_id.eq(accounts::id)))
    .where_(accounts::active.eq(true))
@@ -172,12 +181,12 @@ where id in (
 ```
 
 ```rust
-let published_authors = ctx
+let published_authors = dsl
     .select(posts::account_id)
     .from(posts::table)
     .where_(posts::published.eq(true));
 
-ctx.select((accounts::id, accounts::email))
+dsl.select((accounts::id, accounts::email))
    .from(accounts::table)
    .where_(accounts::id.in_(published_authors))
 ```
@@ -198,7 +207,7 @@ where profile @> '{"active": true}'::jsonb
 ```
 
 ```rust
-ctx.select((accounts::id, accounts::profile.expr().json_get_text("role")))
+dsl.select((accounts::id, accounts::profile.expr().json_get_text("role")))
    .from(accounts::table)
    .where_(
        accounts::profile
@@ -232,7 +241,7 @@ order by id asc
 ```
 
 ```rust
-ctx.select((
+dsl.select((
        accounts::id,
        concat(
            coalesce((accounts::display_name, accounts::email)),
@@ -256,7 +265,7 @@ returning id
 ```
 
 ```rust
-ctx.insert_into(users::table)
+dsl.insert_into(users::table)
    .values((
        users::email.set("tara@example.com"),
        users::active.set(true),
@@ -276,7 +285,7 @@ returning id, display_name, active
 ```
 
 ```rust
-ctx.insert_into(users::table)
+dsl.insert_into(users::table)
    .values((
        users::id.set(4_i64),
        users::email.set("ben@example.com"),
@@ -447,37 +456,16 @@ use fuwa::prelude::*;
 use schema::{posts, users};
 ```
 
-### 5. build and execute queries
+### 5. connect and query
 
-`Context` is the query builder entry point. plain values passed to comparisons
-and assignments become bind parameters automatically, so they're never just
-stuffed into the SQL text. `bind(...)` still works when you want to be explicit.
+`Dsl::using(...)` is the query builder entry point. pass it a postgres
+connection once; queries created from that context are ready to execute. plain
+values passed to comparisons and assignments become bind parameters
+automatically, so they're never just stuffed into the SQL text. `bind(...)`
+still works when you want to be explicit.
 
-```rust
-let ctx = Context::new();
-
-let rows = ctx
-    .select((users::id, users::email, posts::title))
-    .from(users::table)
-    .join(posts::table.on(posts::user_id.eq(users::id)))
-    .where_(users::active.eq(true))
-    .order_by(users::created_at.desc())
-    .limit(20)
-    .fetch_all::<(i64, String, String)>(&client)
-    .await?;
-
-let users = ctx
-    .select(users::all())
-    .from(users::table)
-    .where_(users::email.ilike("%@example.com"))
-    .fetch_all::<users::Record>(&client)
-    .await?;
-```
-
-### full example
-
-this assumes `src/schema.rs` was generated from the `users` + `posts` tables
-up above.
+this example assumes `src/schema.rs` was generated from the `users` + `posts`
+tables up above.
 
 ```rust
 mod schema;
@@ -487,7 +475,7 @@ use schema::{posts, users};
 use tokio_postgres::NoTls;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")?;
     let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
 
@@ -497,19 +485,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let ctx = Context::new();
+    let dsl = Dsl::using(&client);
 
-    let user_id = ctx
+    let user_id = dsl
         .insert_into(users::table)
         .values((
             users::email.set("tara@example.com"),
             users::active.set(true),
         ))
         .returning(users::id)
-        .fetch_one::<i64>(&client)
+        .fetch_one::<i64>()
         .await?;
 
-    let post_id = ctx
+    let post_id = dsl
         .insert_into(posts::table)
         .values((
             posts::user_id.set(user_id),
@@ -517,38 +505,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             posts::published.set(true),
         ))
         .returning(posts::id)
-        .fetch_one::<i64>(&client)
+        .fetch_one::<i64>()
         .await?;
 
-    let joined = ctx
+    let joined = dsl
         .select((users::id, users::email, posts::title))
         .from(users::table)
         .join(posts::table.on(posts::user_id.eq(users::id)))
         .where_(users::active.eq(true).and(posts::published.eq(true)))
         .order_by((users::id.asc(), posts::id.desc()))
         .limit(20)
-        .fetch_all::<(i64, String, String)>(&client)
+        .fetch_all::<(i64, String, String)>()
         .await?;
 
-    let matching_users = ctx
+    let matching_users = dsl
         .select(users::all())
         .from(users::table)
         .where_(users::email.ilike("%@example.com"))
-        .fetch_all::<users::Record>(&client)
+        .fetch_all::<users::Record>()
         .await?;
 
-    let renamed_email = ctx
+    let renamed_email = dsl
         .update(users::table)
         .set(users::email.set("new@example.com"))
         .where_(users::id.eq(user_id))
         .returning(users::email)
-        .fetch_one::<String>(&client)
+        .fetch_one::<String>()
         .await?;
 
-    let deleted_posts = ctx
+    let deleted_posts = dsl
         .delete_from(posts::table)
         .where_(posts::id.eq(post_id))
-        .execute(&client)
+        .execute()
         .await?;
 
     println!("{joined:?}");
@@ -559,11 +547,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## postgres transactions
+
+`DslContext::transaction(...)` opens a postgres transaction, passes a
+transaction-scoped DSL context to the callback, commits on success, and rolls
+back when the callback returns an error:
+
+```rust
+use fuwa::prelude::*;
+
+async fn transaction_example(
+    client: &mut tokio_postgres::Client,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut dsl = Dsl::using(client);
+
+    dsl.transaction(|tx| {
+        Box::pin(async move {
+            tx.insert_into(users::table)
+                .values((
+                    users::email.set("queued@example.com"),
+                    users::active.set(true),
+                ))
+                .execute()
+                .await?;
+
+            Ok(())
+        })
+    })
+    .await?;
+
+    Ok(())
+}
+```
+
 ## postgres streaming
 
 `fetch_stream` and `fetch_chunked` use PostgreSQL portals for server-side
-streaming. Portals only live for the duration of a transaction, so pass an
-open transaction and keep it alive until the stream is exhausted or dropped:
+streaming. Portals only live for the duration of a transaction, so bind a DSL
+context to an open transaction and keep it alive until the stream is exhausted
+or dropped:
 
 ```rust
 use futures_util::StreamExt;
@@ -571,12 +593,14 @@ use fuwa::prelude::*;
 
 async fn stream_example(
     client: &mut tokio_postgres::Client,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let tx = client.transaction().await?;
 
     {
-        let mut chunks = raw("select id, email from users order by id")
-            .fetch_chunked::<(i64, String)>(500, &tx)
+        let dsl = Dsl::using(&tx);
+        let mut chunks = dsl
+            .raw("select id, email from users order by id")
+            .fetch_chunked::<(i64, String)>(500)
             .await?;
 
         while let Some(chunk) = chunks.next().await {
@@ -599,9 +623,11 @@ for SQL the typed DSL doesnt cover yet, you can drop into raw SQL with separate 
 use fuwa::prelude::*;
 
 async fn raw_example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
-    let rows = raw(r#"select email from users where email ~* $1"#)
+    let dsl = Dsl::using(client);
+    let rows = dsl
+        .raw(r#"select email from users where email ~* $1"#)
         .bind(r"@example\.com$")
-        .fetch_all::<String>(client)
+        .fetch_all::<String>()
         .await?;
 
     println!("{rows:?}");

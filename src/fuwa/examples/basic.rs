@@ -10,8 +10,20 @@ mod users {
     pub const active: Field<bool, NotNull> = Field::new(table, "active");
 }
 
-fn main() -> fuwa::Result<()> {
-    let sql = Context::new()
+#[tokio::main]
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")?;
+    let (client, connection) =
+        tokio_postgres::connect(&database_url, tokio_postgres::NoTls).await?;
+
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("postgres connection error: {err}");
+        }
+    });
+
+    let dsl = Dsl::using(&client);
+    let sql = dsl
         .select((users::id, users::email))
         .from(users::table)
         .where_(users::active.eq(bind(true)))
