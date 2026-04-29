@@ -23,7 +23,7 @@ pub use fuwa_core::{
     sum, AliasedSubquery, ArithmeticOp, ArrayAggInput, ArrayQuantifier, Assignment, Assignments,
     AvgOutput, BinaryOp, BindParam, BindValue, CaseWhen, CaseWhenStart, CoalesceArgs,
     CoalesceNullability, CoalesceNullabilityList, Condition, ConflictTarget, DeleteQuery, Error,
-    Excluded, Expr, ExprList, ExprNode, Field, FieldRef, InOperand, InOperandNode,
+    Excluded, Expr, ExprList, ExprNode, Field, FieldRef, FieldSources, InOperand, InOperandNode,
     InsertConflictBuilder, InsertQuery, IntoBindValue, IntoExpr, Join, JoinKind, JoinTarget,
     NotNull, NotSingleColumn, NullabilityOutput, Nullable, NullableIfEither, OrderByList,
     OrderDirection, OrderExpr, RenderQuery, RenderedQuery, Result, SelectItem, SelectQuery,
@@ -61,10 +61,10 @@ pub mod prelude {
         jsonb_array_length, max, min, not, nullable, nullif, selection_as, string_agg, sum,
         AliasedSubquery, ArrayAggInput, Assignment, Assignments, AvgOutput, CaseWhen,
         CaseWhenStart, Condition, ConflictTarget, DeleteQuery, Error, Excluded, Expr, ExprList,
-        Field, InOperand, InsertConflictBuilder, InsertQuery, IntoExpr, NotNull, NotSingleColumn,
-        Nullable, OrderByList, OrderDirection, OrderExpr, RenderQuery, RenderedQuery, Result,
-        SelectQuery, Selectable, SqlArrayElement, SqlJsonb, SumOutput, Table, TableSource,
-        UpdateQuery, WithBuilder,
+        Field, FieldSources, InOperand, InsertConflictBuilder, InsertQuery, IntoExpr, NotNull,
+        NotSingleColumn, Nullable, OrderByList, OrderDirection, OrderExpr, RenderQuery,
+        RenderedQuery, Result, SelectQuery, Selectable, SqlArrayElement, SqlJsonb, SumOutput,
+        Table, TableSource, UpdateQuery, WithBuilder,
     };
     pub use fuwa_derive::FromRow;
     pub use fuwa_postgres::{Dsl, DslContext, FromRow, PgStream, TransactionFuture};

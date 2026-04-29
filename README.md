@@ -99,8 +99,8 @@ where id > 10
 
 ```rust
 let active_accounts = Table::unqualified("active_accounts");
-let active_id = active_accounts.field::<i64, NotNull>("id");
-let active_email = active_accounts.field::<String, NotNull>("email");
+let (active_id, active_email) =
+    active_accounts.fields_of((accounts::id, accounts::email));
 
 dsl.with(
        "active_accounts",
@@ -131,13 +131,17 @@ let recent = dsl
     .from(accounts::table)
     .where_(accounts::active.eq(true))
     .alias("recent");
-let recent_id = recent.field::<i64, NotNull>("id");
-let recent_email = recent.field::<String, NotNull>("email");
+let (recent_id, recent_email) = recent.fields_of((accounts::id, accounts::email));
 
 dsl.select((recent_id, recent_email))
    .from(recent)
    .where_(recent_id.gt(10_i64))
 ```
+
+for computed or renamed columns, `field::<T, N>("name")` is still there.
+`field_of` keeps the source field's nullability exactly ~ if a subquery uses a
+left join and the selected value can become null, mark that projection nullable
+yourself with `field::<T, Nullable>("name")`.
 
 the same aliased subquery source works in joins:
 
@@ -160,7 +164,7 @@ let post_counts = dsl
     .group_by(posts::account_id)
     .having(count_star().gt(1_i64))
     .alias("post_counts");
-let post_counts_account_id = post_counts.field::<i64, NotNull>("account_id");
+let post_counts_account_id = post_counts.field_of(posts::account_id);
 
 dsl.select((accounts::email, post_counts_account_id))
    .from(accounts::table)

@@ -1073,8 +1073,7 @@ mod tests {
     #[test]
     fn renders_select_with_cte_and_outer_binds() {
         let active_users = Table::unqualified("active_users");
-        let active_user_id = active_users.field::<i64, NotNull>("id");
-        let active_user_email = active_users.field::<String, NotNull>("email");
+        let (active_user_id, active_user_email) = active_users.fields_of((users::id, users::email));
 
         let cte = Context::new()
             .select((users::id, users::email))
@@ -1104,9 +1103,9 @@ mod tests {
     #[test]
     fn renders_chained_ctes_with_left_to_right_binds() {
         let ranked = Table::unqualified("ranked");
-        let ranked_id = ranked.field::<i64, NotNull>("id");
+        let ranked_id = ranked.field_of(users::id);
         let recent = Table::unqualified("recent");
-        let recent_id = recent.field::<i64, NotNull>("id");
+        let recent_id = recent.field_of(ranked_id);
 
         let ranked_query = Context::new()
             .select(users::id)
@@ -1146,8 +1145,7 @@ mod tests {
             .from(users::table)
             .where_(users::active.eq(bind(true)))
             .alias("u");
-        let subquery_id = subquery.field::<i64, NotNull>("id");
-        let subquery_email = subquery.field::<String, NotNull>("email");
+        let (subquery_id, subquery_email) = subquery.fields_of((users::id, users::email));
 
         let query = Context::new()
             .select((subquery_id, subquery_email))
@@ -1176,7 +1174,7 @@ mod tests {
             .group_by(posts::user_id)
             .having(count_star().gt(bind(1_i64)))
             .alias("pc");
-        let post_counts_user_id = post_counts.field::<i64, NotNull>("user_id");
+        let post_counts_user_id = post_counts.field_of(posts::user_id);
 
         let query = Context::new()
             .select(users::id)
@@ -1197,6 +1195,48 @@ mod tests {
             )
         );
         assert_eq!(query.binds().len(), 2);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "field_of source field `email` is not selected by subquery alias `u`"
+    )]
+    fn aliased_subquery_field_of_rejects_unselected_source_field() {
+        let subquery = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .alias("u");
+
+        let _ = subquery.field_of(users::email);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "field_of source field `id` is not selected by subquery alias `u`"
+    )]
+    fn aliased_subquery_field_of_rejects_same_named_source_field_from_another_table() {
+        let accounts = Table::new("public", "accounts");
+        let account_id: Field<String, Nullable> = accounts.field("id");
+        let subquery = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .alias("u");
+
+        let _ = subquery.field_of(account_id);
+    }
+
+    #[test]
+    fn aliased_subquery_field_of_preserves_source_nullability_after_left_join() {
+        fn assert_field_type<T, N>(_: Field<T, N>) {}
+
+        let subquery = Context::new()
+            .select(nullable(posts::title))
+            .from(users::table)
+            .left_join(posts::table.on(posts::user_id.eq(users::id)))
+            .alias("p");
+        let projected_title = subquery.field_of(posts::title);
+
+        assert_field_type::<String, NotNull>(projected_title);
     }
 
     #[test]

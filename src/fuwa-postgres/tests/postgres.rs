@@ -587,6 +587,58 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
 
     let dsl = Dsl::using(&client);
 
+    let active_accounts = Table::unqualified("active_accounts");
+    let active_account_id = active_accounts.field_of(accounts::id);
+    let active_account_email = active_accounts.field_of(accounts::email);
+
+    let active_accounts_cte = dsl
+        .select((accounts::id, accounts::email))
+        .from(accounts::table)
+        .where_(accounts::active.eq(bind(true)));
+    let active_account_posts = dsl
+        .with("active_accounts", active_accounts_cte)
+        .select((active_account_id, active_account_email, posts::title))
+        .from(active_accounts)
+        .join(posts::table.on(posts::account_id.eq(active_account_id)))
+        .where_(posts::published.eq(bind(true)))
+        .order_by((active_account_id.asc(), posts::id.asc()))
+        .render()?;
+
+    assert_eq!(
+        active_account_posts.sql(),
+        concat!(
+            r#"with "active_accounts" as (select "accounts"."id", "accounts"."email" "#,
+            r#"from "fuwa_it_complex"."accounts" where ("accounts"."active" = $1)) "#,
+            r#"select "active_accounts"."id", "active_accounts"."email", "posts"."title" "#,
+            r#"from "active_accounts" join "fuwa_it_complex"."posts" "#,
+            r#"on ("posts"."account_id" = "active_accounts"."id") "#,
+            r#"where ("posts"."published" = $2) "#,
+            r#"order by "active_accounts"."id" asc, "posts"."id" asc"#
+        )
+    );
+
+    let active_accounts_cte = dsl
+        .select((accounts::id, accounts::email))
+        .from(accounts::table)
+        .where_(accounts::active.eq(bind(true)));
+    let active_account_posts = dsl
+        .with("active_accounts", active_accounts_cte)
+        .select((active_account_id, active_account_email, posts::title))
+        .from(active_accounts)
+        .join(posts::table.on(posts::account_id.eq(active_account_id)))
+        .where_(posts::published.eq(bind(true)))
+        .order_by((active_account_id.asc(), posts::id.asc()))
+        .fetch_all::<(i64, String, String)>()
+        .await?;
+
+    assert_eq!(
+        active_account_posts,
+        vec![
+            (1, "ada@example.com".to_owned(), "Rust DSLs".to_owned()),
+            (3, "cy@example.com".to_owned(), "Fuwa roadmap".to_owned()),
+        ]
+    );
+
     let published_for_active_accounts = dsl
         .select((accounts::email, posts::title, posts::score))
         .from(accounts::table)

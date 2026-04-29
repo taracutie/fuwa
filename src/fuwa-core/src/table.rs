@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::{JoinTarget, NotSingleColumn, SelectQuery};
+use crate::{ExprNode, JoinTarget, NotSingleColumn, SelectQuery};
 
 /// Marker for non-null SQL expressions and fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,6 +49,30 @@ impl Table {
     /// Create a field attached to this table.
     pub const fn field<T, N>(self, name: &'static str) -> Field<T, N> {
         Field::new(self, name)
+    }
+
+    /// Create a typed field attached to this table using another field's name
+    /// and type markers.
+    ///
+    /// This preserves the source field's nullability exactly. If a query can
+    /// produce nulls, such as a field selected from the nullable side of a left
+    /// join, use a nullable source field or create the alias field explicitly
+    /// with `field::<T, Nullable>(...)`.
+    pub const fn field_of<T, N>(self, source: Field<T, N>) -> Field<T, N> {
+        self.field(source.name())
+    }
+
+    /// Create typed fields attached to this table using another field or tuple
+    /// of fields as the source.
+    ///
+    /// This is useful for CTE handles created with `Table::unqualified(...)`.
+    /// It preserves source field nullability exactly and does not infer
+    /// nullable promotion from joins inside the CTE.
+    pub fn fields_of<F>(self, source: F) -> F::Output
+    where
+        F: FieldSources,
+    {
+        source.rebind_to(self)
     }
 
     /// Attach an `ON` condition for use with `join` or `left_join`.
@@ -145,6 +169,52 @@ impl AliasedSubquery {
         Table::unqualified(self.alias).field(name)
     }
 
+    /// Create a typed field attached to this subquery alias using another
+    /// field's name and type markers.
+    ///
+    /// This preserves the source field's nullability exactly. If the subquery
+    /// projection can produce nulls, such as a field selected from the nullable
+    /// side of a left join, use a nullable source field or create the alias
+    /// field explicitly with `field::<T, Nullable>(...)`.
+    ///
+    /// Panics if the source field is not selected directly by this
+    /// subquery. Computed expressions and renamed columns still need
+    /// `field::<T, N>(...)`.
+    pub fn field_of<T, N>(&self, source: Field<T, N>) -> Field<T, N> {
+        self.assert_field_selected(source);
+        Table::unqualified(self.alias).field_of(source)
+    }
+
+    /// Create typed fields attached to this subquery alias using another field
+    /// or tuple of fields as the source.
+    ///
+    /// This preserves source field nullability exactly and panics if any source
+    /// field is not selected directly by this subquery.
+    pub fn fields_of<F>(&self, source: F) -> F::Output
+    where
+        F: FieldSources,
+    {
+        source.assert_selected_by(self);
+        source.rebind_to(Table::unqualified(self.alias))
+    }
+
+    fn assert_field_selected<T, N>(&self, source: Field<T, N>) {
+        let source_ref = crate::FieldRef::new(source.table(), source.name());
+        let selected = self.query.selection.iter().any(|item| {
+            matches!(
+                &item.expr,
+                ExprNode::Field(field) if *field == source_ref
+            )
+        });
+
+        assert!(
+            selected,
+            "field_of source field `{}` is not selected by subquery alias `{}`",
+            source.name(),
+            self.alias
+        );
+    }
+
     /// Attach an `ON` condition for use with `join` or `left_join`.
     pub fn on(self, condition: crate::Condition) -> JoinTarget {
         JoinTarget {
@@ -198,3 +268,59 @@ impl<T, N> Field<T, N> {
         self.name
     }
 }
+
+/// A field or tuple of fields that can be rebound to a table or subquery alias.
+#[doc(hidden)]
+pub trait FieldSources {
+    type Output;
+
+    #[doc(hidden)]
+    fn rebind_to(self, table: Table) -> Self::Output;
+
+    #[doc(hidden)]
+    fn assert_selected_by(&self, subquery: &AliasedSubquery);
+}
+
+impl<T, N> FieldSources for Field<T, N> {
+    type Output = Field<T, N>;
+
+    fn rebind_to(self, table: Table) -> Self::Output {
+        table.field_of(self)
+    }
+
+    fn assert_selected_by(&self, subquery: &AliasedSubquery) {
+        subquery.assert_field_selected(*self)
+    }
+}
+
+macro_rules! impl_tuple_field_sources {
+    ($($ty:ident $var:ident),+ $(,)?) => {
+        impl<$($ty),+> FieldSources for ($($ty,)+)
+        where
+            $($ty: FieldSources),+
+        {
+            type Output = ($($ty::Output,)+);
+
+            fn rebind_to(self, table: Table) -> Self::Output {
+                let ($($var,)+) = self;
+                ($($var.rebind_to(table),)+)
+            }
+
+            fn assert_selected_by(&self, subquery: &AliasedSubquery) {
+                let ($($var,)+) = self;
+                $(
+                    $var.assert_selected_by(subquery);
+                )+
+            }
+        }
+    };
+}
+
+impl_tuple_field_sources!(A a);
+impl_tuple_field_sources!(A a, B b);
+impl_tuple_field_sources!(A a, B b, C c);
+impl_tuple_field_sources!(A a, B b, C c, D d);
+impl_tuple_field_sources!(A a, B b, C c, D d, E e);
+impl_tuple_field_sources!(A a, B b, C c, D d, E e, F f);
+impl_tuple_field_sources!(A a, B b, C c, D d, E e, F f, G g);
+impl_tuple_field_sources!(A a, B b, C c, D d, E e, F f, G g, H h);
