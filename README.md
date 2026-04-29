@@ -186,6 +186,39 @@ ctx.select((accounts::id, accounts::email))
 `SelectQuery`s whose selected SQL type matches the left-hand expression.
 collect custom iterators into a `Vec` before passing them in.
 
+### jsonb + postgres arrays
+
+```sql
+select id, profile ->> 'role'
+from accounts
+where profile @> '{"active": true}'::jsonb
+  and profile ? 'role'
+  and tags && array['beta', 'internal']
+  and email = any(array['tara@example.com', 'ada@example.com'])
+```
+
+```rust
+ctx.select((accounts::id, accounts::profile.expr().json_get_text("role")))
+   .from(accounts::table)
+   .where_(
+       accounts::profile
+           .expr()
+           .contains(serde_json::json!({ "active": true }))
+           .and(accounts::profile.expr().has_key("role"))
+           .and(accounts::tags.expr().overlaps(vec!["beta", "internal"]))
+           .and(
+               accounts::email
+                   .expr()
+                   .eq_any(vec!["tara@example.com", "ada@example.com"]),
+           ),
+   )
+```
+
+jsonb operators are available on `Expr<serde_json::Value, _>`, and array
+operators are available on `Expr<Vec<T>, _>`, so generated field constants use
+`.expr()` before postgres-native helpers like `json_get_text`, `contains`,
+`overlaps`, `concat`, `eq_any`, and `eq_all`.
+
 ### case / coalesce / concat
 
 ```sql
@@ -566,8 +599,8 @@ for SQL the typed DSL doesnt cover yet, you can drop into raw SQL with separate 
 use fuwa::prelude::*;
 
 async fn raw_example(client: &tokio_postgres::Client) -> fuwa::Result<()> {
-    let rows = raw(r#"select filename from "ImageMetadata" where filename = any($1)"#)
-        .bind(vec!["a.jpg".to_owned(), "b.jpg".to_owned()])
+    let rows = raw(r#"select email from users where email ~* $1"#)
+        .bind(r"@example\.com$")
         .fetch_all::<String>(client)
         .await?;
 

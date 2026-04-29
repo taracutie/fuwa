@@ -18,9 +18,10 @@ pub use error::{Error, Result};
 pub use expr::{
     array_agg, avg, bool_and, bool_or, case_when, coalesce, concat, count, count_star,
     jsonb_array_length, max, min, not, nullable, nullif, string_agg, sum, ArithmeticOp,
-    ArrayAggInput, AvgOutput, BinaryOp, CaseWhen, CaseWhenStart, CoalesceArgs, CoalesceNullability,
-    CoalesceNullabilityList, Condition, Expr, ExprNode, FieldRef, InOperand, InOperandNode,
-    IntoExpr, NullableIfEither, OrderDirection, OrderExpr, SqlNumeric, SumOutput, UnaryOp,
+    ArrayAggInput, ArrayQuantifier, AvgOutput, BinaryOp, CaseWhen, CaseWhenStart, CoalesceArgs,
+    CoalesceNullability, CoalesceNullabilityList, Condition, Expr, ExprNode, FieldRef, InOperand,
+    InOperandNode, IntoExpr, NullableIfEither, OrderDirection, OrderExpr, SqlArrayElement,
+    SqlJsonb, SqlNumeric, SumOutput, UnaryOp,
 };
 pub use ident::quote_ident;
 pub use query::{
@@ -44,7 +45,7 @@ pub mod prelude {
         CaseWhenStart, Condition, ConflictTarget, Context, DeleteQuery, Error, Excluded, Expr,
         ExprList, Field, InOperand, InsertConflictBuilder, InsertQuery, IntoExpr, NotNull,
         NotSingleColumn, Nullable, OrderByList, OrderDirection, OrderExpr, RawQuery, RenderQuery,
-        RenderedQuery, Result, SelectQuery, Selectable, SumOutput, Table, TableSource, UpdateQuery,
-        WithBuilder,
+        RenderedQuery, Result, SelectQuery, Selectable, SqlArrayElement, SqlJsonb, SumOutput,
+        Table, TableSource, UpdateQuery, WithBuilder,
     };
 }

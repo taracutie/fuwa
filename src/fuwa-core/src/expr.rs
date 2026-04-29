@@ -42,6 +42,14 @@ pub enum BinaryOp {
     Or,
     Like,
     ILike,
+    JsonGet,
+    JsonGetText,
+    JsonPath,
+    JsonPathText,
+    Contains,
+    HasKey,
+    Overlaps,
+    ArrayConcat,
 }
 
 /// Arithmetic SQL operators supported by typed numeric expressions.
@@ -59,6 +67,13 @@ pub enum UnaryOp {
     Not,
 }
 
+/// PostgreSQL array comparison quantifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayQuantifier {
+    Any,
+    All,
+}
+
 /// Marker trait for SQL types that support arithmetic operators.
 #[doc(hidden)]
 pub trait SqlNumeric {}
@@ -72,6 +87,41 @@ macro_rules! impl_sql_numeric {
 }
 
 impl_sql_numeric!(i16, i32, i64, f32, f64, Decimal);
+
+/// Marker trait for SQL values backed by PostgreSQL `jsonb`.
+#[doc(hidden)]
+pub trait SqlJsonb {}
+
+impl SqlJsonb for serde_json::Value {}
+
+/// Marker trait for Rust element types that represent PostgreSQL array elements.
+#[doc(hidden)]
+pub trait SqlArrayElement {}
+
+macro_rules! impl_sql_array_element {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl SqlArrayElement for $ty {}
+        )+
+    };
+}
+
+impl_sql_array_element!(
+    i16,
+    i32,
+    i64,
+    f32,
+    f64,
+    bool,
+    String,
+    Uuid,
+    chrono::NaiveDate,
+    chrono::NaiveDateTime,
+    chrono::DateTime<chrono::Utc>,
+    Decimal,
+    serde_json::Value,
+    Vec<u8>,
+);
 
 /// Marker trait for SQL scalar types accepted by `array_agg`.
 ///
@@ -242,6 +292,11 @@ pub enum ExprNode {
         op: ArithmeticOp,
         left: Box<ExprNode>,
         right: Box<ExprNode>,
+    },
+    ArrayComparison {
+        quantifier: ArrayQuantifier,
+        left: Box<ExprNode>,
+        array: Box<ExprNode>,
     },
     StringConcat {
         left: Box<ExprNode>,
@@ -465,6 +520,24 @@ where
     })
 }
 
+fn binary_expr<T>(left: ExprNode, op: BinaryOp, right: ExprNode) -> Expr<T, Nullable> {
+    Expr::from_node(ExprNode::Binary {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+    })
+}
+
+fn binary_condition(left: ExprNode, op: BinaryOp, right: ExprNode) -> Condition {
+    Condition {
+        node: ExprNode::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+    }
+}
+
 impl<T, N, R> Add<R> for Expr<T, N>
 where
     T: SqlNumeric,
@@ -514,6 +587,147 @@ where
 
     fn div(self, rhs: R) -> Self::Output {
         arithmetic_expr(self, ArithmeticOp::Div, rhs)
+    }
+}
+
+impl<T, N> Expr<T, N>
+where
+    T: SqlJsonb,
+{
+    pub fn json_get<K>(self, key: K) -> Expr<serde_json::Value, Nullable>
+    where
+        K: IntoExpr<String>,
+    {
+        binary_expr(
+            self.into_node(),
+            BinaryOp::JsonGet,
+            key.into_expr().into_node(),
+        )
+    }
+
+    pub fn json_get_text<K>(self, key: K) -> Expr<String, Nullable>
+    where
+        K: IntoExpr<String>,
+    {
+        binary_expr(
+            self.into_node(),
+            BinaryOp::JsonGetText,
+            key.into_expr().into_node(),
+        )
+    }
+
+    pub fn json_path<P>(self, path: P) -> Expr<serde_json::Value, Nullable>
+    where
+        P: IntoExpr<Vec<String>>,
+    {
+        binary_expr(
+            self.into_node(),
+            BinaryOp::JsonPath,
+            path.into_expr().into_node(),
+        )
+    }
+
+    pub fn json_path_text<P>(self, path: P) -> Expr<String, Nullable>
+    where
+        P: IntoExpr<Vec<String>>,
+    {
+        binary_expr(
+            self.into_node(),
+            BinaryOp::JsonPathText,
+            path.into_expr().into_node(),
+        )
+    }
+
+    pub fn contains<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<T>,
+    {
+        binary_condition(
+            self.into_node(),
+            BinaryOp::Contains,
+            rhs.into_expr().into_node(),
+        )
+    }
+
+    pub fn has_key<K>(self, key: K) -> Condition
+    where
+        K: IntoExpr<String>,
+    {
+        binary_condition(
+            self.into_node(),
+            BinaryOp::HasKey,
+            key.into_expr().into_node(),
+        )
+    }
+}
+
+impl<T, N> Expr<Vec<T>, N>
+where
+    T: SqlArrayElement,
+{
+    pub fn contains<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<Vec<T>>,
+    {
+        binary_condition(
+            self.into_node(),
+            BinaryOp::Contains,
+            rhs.into_expr().into_node(),
+        )
+    }
+
+    pub fn overlaps<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<Vec<T>>,
+    {
+        binary_condition(
+            self.into_node(),
+            BinaryOp::Overlaps,
+            rhs.into_expr().into_node(),
+        )
+    }
+
+    pub fn concat<R>(self, rhs: R) -> Expr<Vec<T>, <N as NullableIfEither<R::Nullability>>::Output>
+    where
+        R: IntoExpr<Vec<T>>,
+        N: NullableIfEither<R::Nullability>,
+    {
+        Expr::from_node(ExprNode::Binary {
+            op: BinaryOp::ArrayConcat,
+            left: Box::new(self.into_node()),
+            right: Box::new(rhs.into_expr().into_node()),
+        })
+    }
+}
+
+impl<T, N> Expr<T, N>
+where
+    T: SqlArrayElement,
+{
+    pub fn eq_any<A>(self, array: A) -> Condition
+    where
+        A: IntoExpr<Vec<T>>,
+    {
+        Condition {
+            node: ExprNode::ArrayComparison {
+                quantifier: ArrayQuantifier::Any,
+                left: Box::new(self.into_node()),
+                array: Box::new(array.into_expr().into_node()),
+            },
+        }
+    }
+
+    pub fn eq_all<A>(self, array: A) -> Condition
+    where
+        A: IntoExpr<Vec<T>>,
+    {
+        Condition {
+            node: ExprNode::ArrayComparison {
+                quantifier: ArrayQuantifier::All,
+                left: Box::new(self.into_node()),
+                array: Box::new(array.into_expr().into_node()),
+            },
+        }
     }
 }
 

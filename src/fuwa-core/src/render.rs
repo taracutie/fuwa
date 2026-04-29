@@ -4,9 +4,9 @@ use crate::expr::InOperandKind;
 use crate::query::{InsertConflict, SelectDistinct};
 use crate::table::TableSourceKind;
 use crate::{
-    quote_ident, ArithmeticOp, Assignment, BinaryOp, BindValue, DeleteQuery, Error, ExprNode,
-    FieldRef, InsertQuery, Join, JoinKind, OrderDirection, OrderExpr, Result, SelectItem,
-    SelectQuery, Table, TableSourceRef, UnaryOp, UpdateQuery,
+    quote_ident, ArithmeticOp, ArrayQuantifier, Assignment, BinaryOp, BindValue, DeleteQuery,
+    Error, ExprNode, FieldRef, InsertQuery, Join, JoinKind, OrderDirection, OrderExpr, Result,
+    SelectItem, SelectQuery, Table, TableSourceRef, UnaryOp, UpdateQuery,
 };
 
 /// A rendered SQL statement plus owned bind values.
@@ -708,6 +708,20 @@ fn render_expr_with_context(
             renderer.sql.push(')');
             Ok(())
         }
+        ExprNode::ArrayComparison {
+            quantifier,
+            left,
+            array,
+        } => {
+            renderer.sql.push('(');
+            render_expr_with_context(*left, renderer, context)?;
+            renderer.sql.push_str(" = ");
+            renderer.sql.push_str(array_quantifier_sql(quantifier));
+            renderer.sql.push('(');
+            render_expr_with_context(*array, renderer, context)?;
+            renderer.sql.push_str("))");
+            Ok(())
+        }
         ExprNode::StringConcat { left, right } => {
             renderer.sql.push('(');
             render_expr_with_context(*left, renderer, context)?;
@@ -771,6 +785,14 @@ fn binary_op_sql(op: BinaryOp) -> &'static str {
         BinaryOp::Or => "or",
         BinaryOp::Like => "like",
         BinaryOp::ILike => "ilike",
+        BinaryOp::JsonGet => "->",
+        BinaryOp::JsonGetText => "->>",
+        BinaryOp::JsonPath => "#>",
+        BinaryOp::JsonPathText => "#>>",
+        BinaryOp::Contains => "@>",
+        BinaryOp::HasKey => "?",
+        BinaryOp::Overlaps => "&&",
+        BinaryOp::ArrayConcat => "||",
     }
 }
 
@@ -780,6 +802,13 @@ fn arithmetic_op_sql(op: ArithmeticOp) -> &'static str {
         ArithmeticOp::Sub => "-",
         ArithmeticOp::Mul => "*",
         ArithmeticOp::Div => "/",
+    }
+}
+
+fn array_quantifier_sql(quantifier: ArrayQuantifier) -> &'static str {
+    match quantifier {
+        ArrayQuantifier::Any => "any",
+        ArrayQuantifier::All => "all",
     }
 }
 
@@ -800,6 +829,7 @@ mod tests {
         pub const ratio: Field<f32, NotNull> = Field::new(table, "ratio");
         pub const created_at: Field<i64, NotNull> = Field::new(table, "created_at");
         pub const profile: Field<serde_json::Value, Nullable> = Field::new(table, "profile");
+        pub const tags: Field<Vec<String>, NotNull> = Field::new(table, "tags");
     }
 
     #[allow(non_upper_case_globals)]
@@ -933,6 +963,91 @@ mod tests {
             )
         );
         assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn renders_jsonb_operators() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<serde_json::Value, Nullable>(users::profile.expr().json_get("role"));
+        assert_expr_type::<String, Nullable>(users::profile.expr().json_get_text("role"));
+        assert_expr_type::<serde_json::Value, Nullable>(
+            users::profile.expr().json_path(vec!["settings", "theme"]),
+        );
+        assert_expr_type::<String, Nullable>(
+            users::profile
+                .expr()
+                .json_path_text(&["settings", "locale"][..]),
+        );
+
+        let query = Context::new()
+            .select((
+                users::profile.expr().json_get("role"),
+                users::profile.expr().json_get_text("role"),
+                users::profile.expr().json_path(vec!["settings", "theme"]),
+                users::profile
+                    .expr()
+                    .json_path_text(&["settings", "locale"][..]),
+            ))
+            .from(users::table)
+            .where_(
+                users::profile
+                    .expr()
+                    .contains(serde_json::json!({ "role": "admin" }))
+                    .and(users::profile.expr().has_key("role")),
+            )
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select ("users"."profile" -> $1), "#,
+                r#"("users"."profile" ->> $2), "#,
+                r#"("users"."profile" #> $3), "#,
+                r#"("users"."profile" #>> $4) from "public"."users" "#,
+                r#"where (("users"."profile" @> $5) and ("users"."profile" ? $6))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 6);
+    }
+
+    #[test]
+    fn renders_array_operators_and_quantified_comparisons() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<Vec<String>, NotNull>(users::tags.expr().concat(vec!["new"]));
+        assert_expr_type::<Vec<String>, Nullable>(nullable(users::tags).concat(vec!["new"]));
+
+        let query = Context::new()
+            .select(users::tags.expr().concat(vec!["vip"]))
+            .from(users::table)
+            .where_(
+                users::tags
+                    .expr()
+                    .contains(vec!["admin", "staff"])
+                    .and(users::tags.expr().overlaps(vec!["vip", "new"]))
+                    .and(
+                        users::email
+                            .expr()
+                            .eq_any(vec!["ada@example.com", "ben@example.com"]),
+                    )
+                    .and(users::signup_rank.expr().eq_all(vec![1_i32, 2_i32])),
+            )
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select ("users"."tags" || $1) from "public"."users" "#,
+                r#"where (((("users"."tags" @> $2) and "#,
+                r#"("users"."tags" && $3)) and "#,
+                r#"("users"."email" = any($4))) and "#,
+                r#"("users"."signup_rank" = all($5)))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 5);
     }
 
     #[test]
