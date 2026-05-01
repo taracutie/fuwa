@@ -1,12 +1,15 @@
 extern crate fuwa_postgres as fuwa;
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures_util::future::poll_fn;
 use fuwa_core::prelude::*;
 use fuwa_derive::FromRow;
 use fuwa_postgres::{create_pool_with_options, Dsl, Pool, PoolOptions, StreamExt};
 use rust_decimal::Decimal;
-use tokio_postgres::NoTls;
+use serde_json::json;
+use tokio_postgres::{AsyncMessage, NoTls};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -22,15 +25,95 @@ fn test_pool(
 
 #[test]
 fn pool_options_reject_zero_max_size() {
-    let err = match create_pool_with_options(
-        "host=localhost user=postgres",
-        PoolOptions { max_size: 0 },
-    ) {
-        Ok(_) => panic!("zero-sized pools should be rejected"),
-        Err(err) => err,
+    let err =
+        match create_pool_with_options("host=localhost user=postgres", PoolOptions { max_size: 0 })
+        {
+            Ok(_) => panic!("zero-sized pools should be rejected"),
+            Err(err) => err,
+        };
+
+    assert!(err
+        .to_string()
+        .contains("max_size must be greater than zero"));
+}
+
+#[tokio::test]
+async fn notify_none_sends_empty_payload_when_database_url_is_set() -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!("skipping NOTIFY integration test: FUWA_TEST_DATABASE_URL is not set");
+        return Ok(());
     };
 
-    assert!(err.to_string().contains("max_size must be greater than zero"));
+    let channel = "fuwa_test_notify_empty_payload";
+    let (listener, mut listener_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let listen = listener.batch_execute("unlisten *; listen fuwa_test_notify_empty_payload;");
+    tokio::pin!(listen);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut listen => break result.map_err(Box::<dyn std::error::Error>::from),
+                message = poll_fn(|cx| listener_connection.poll_message(cx)) => {
+                    match message {
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) => break Err(Box::<dyn std::error::Error>::from(err)),
+                        None => {
+                            break Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "listener connection closed",
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out preparing notification listener",
+        )
+    })??;
+
+    let (sender, sender_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = sender_connection.await {
+            eprintln!("PostgreSQL notification sender connection task failed: {err}");
+        }
+    });
+
+    Dsl::using(&sender).notify(channel, None).await?;
+
+    let notification = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match poll_fn(|cx| listener_connection.poll_message(cx)).await {
+                Some(Ok(AsyncMessage::Notification(notification)))
+                    if notification.channel() == channel =>
+                {
+                    break Ok(notification)
+                }
+                Some(Ok(_)) => {}
+                Some(Err(err)) => break Err(Box::<dyn std::error::Error>::from(err)),
+                None => {
+                    break Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "listener connection closed",
+                    )))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out waiting for notification",
+        )
+    })??;
+
+    assert_eq!(notification.payload(), "");
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq, FromRow)]
@@ -147,7 +230,7 @@ async fn postgres_round_trip_when_database_url_is_set() -> TestResult {
                 13::bigint, 14::bigint, 15::bigint, 16::bigint
             "#,
         )
-        .fetch_one::<(
+        .fetch_one_as::<(
             i64,
             i64,
             i64,
@@ -180,14 +263,14 @@ async fn postgres_round_trip_when_database_url_is_set() -> TestResult {
             users::active.set(bind(true)),
         ))
         .returning(users::id)
-        .fetch_one::<i64>()
+        .fetch_one()
         .await?;
 
     let rows = dsl
         .select((users::id, users::email))
         .from(users::table)
         .where_(users::id.eq(bind(inserted_id)))
-        .fetch_all::<(i64, String)>()
+        .fetch_all()
         .await?;
     assert_eq!(rows, vec![(inserted_id, "a@example.com".to_owned())]);
 
@@ -195,7 +278,7 @@ async fn postgres_round_trip_when_database_url_is_set() -> TestResult {
         .select(users::id)
         .from(users::table)
         .where_(users::email.eq(bind("missing@example.com")))
-        .fetch_optional::<i64>()
+        .fetch_optional()
         .await?;
     assert_eq!(missing, None);
 
@@ -204,7 +287,7 @@ async fn postgres_round_trip_when_database_url_is_set() -> TestResult {
         .set(users::email.set(bind("new@example.com")))
         .where_(users::id.eq(bind(inserted_id)))
         .returning(users::email)
-        .fetch_one::<String>()
+        .fetch_one()
         .await?;
     assert_eq!(updated, "new@example.com");
 
@@ -276,7 +359,7 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
         .select((upsert_users::id, upsert_users::email))
         .from(upsert_users::table)
         .order_by(upsert_users::id.asc())
-        .fetch_all::<(i64, String)>()
+        .fetch_all()
         .await?;
     assert_eq!(
         rows,
@@ -297,7 +380,7 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
         .on_conflict((upsert_users::email,))
         .do_nothing()
         .returning(upsert_users::id)
-        .fetch_optional::<i64>()
+        .fetch_optional()
         .await?;
     assert_eq!(ignored, None);
 
@@ -305,7 +388,7 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
         .select((upsert_users::display_name, upsert_users::active))
         .from(upsert_users::table)
         .where_(upsert_users::email.eq(bind("ada@example.com")))
-        .fetch_one::<(Option<String>, bool)>()
+        .fetch_one()
         .await?;
     assert_eq!(unchanged, (Some("Ada".to_owned()), true));
 
@@ -329,26 +412,24 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
             upsert_users::display_name,
             upsert_users::active,
         ))
-        .fetch_one::<(i64, Option<String>, bool)>()
+        .fetch_one()
         .await?;
     assert_eq!(updated, (2, Some("Benedict".to_owned()), true));
     drop(dsl);
 
     let mut dsl = Dsl::using(&mut client);
     let committed_id = dsl
-        .transaction(|tx| {
-            Box::pin(async move {
-                tx.insert_into(upsert_users::table)
-                    .values((
-                        upsert_users::id.set(bind(5_i64)),
-                        upsert_users::email.set(bind("committed@example.com")),
-                        upsert_users::display_name.set(bind(Some("Committed"))),
-                        upsert_users::active.set(bind(true)),
-                    ))
-                    .returning(upsert_users::id)
-                    .fetch_one::<i64>()
-                    .await
-            })
+        .transaction(async |tx| {
+            tx.insert_into(upsert_users::table)
+                .values((
+                    upsert_users::id.set(bind(5_i64)),
+                    upsert_users::email.set(bind("committed@example.com")),
+                    upsert_users::display_name.set(bind(Some("Committed"))),
+                    upsert_users::active.set(bind(true)),
+                ))
+                .returning(upsert_users::id)
+                .fetch_one()
+                .await
         })
         .await?;
     assert_eq!(committed_id, 5);
@@ -359,37 +440,35 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
         .select(count_star())
         .from(upsert_users::table)
         .where_(upsert_users::email.eq(bind("committed@example.com")))
-        .fetch_one::<i64>()
+        .fetch_one()
         .await?;
     assert_eq!(committed_count, 1);
     drop(dsl);
 
     let mut dsl = Dsl::using(&mut client);
     let tx_result = dsl
-        .transaction(|tx| {
-            Box::pin(async move {
-                tx.insert_into(upsert_users::table)
-                    .values((
-                        upsert_users::id.set(bind(6_i64)),
-                        upsert_users::email.set(bind("rolled-back@example.com")),
-                        upsert_users::display_name.set(bind(Some("Rollback"))),
-                        upsert_users::active.set(bind(true)),
-                    ))
-                    .execute()
-                    .await?;
+        .transaction(async |tx| {
+            tx.insert_into(upsert_users::table)
+                .values((
+                    upsert_users::id.set(bind(6_i64)),
+                    upsert_users::email.set(bind("rolled-back@example.com")),
+                    upsert_users::display_name.set(bind(Some("Rollback"))),
+                    upsert_users::active.set(bind(true)),
+                ))
+                .execute()
+                .await?;
 
-                tx.insert_into(upsert_users::table)
-                    .values((
-                        upsert_users::id.set(bind(1_i64)),
-                        upsert_users::email.set(bind("duplicate-id@example.com")),
-                        upsert_users::display_name.set(bind(None::<String>)),
-                        upsert_users::active.set(bind(true)),
-                    ))
-                    .execute()
-                    .await?;
+            tx.insert_into(upsert_users::table)
+                .values((
+                    upsert_users::id.set(bind(1_i64)),
+                    upsert_users::email.set(bind("duplicate-id@example.com")),
+                    upsert_users::display_name.set(bind(None::<String>)),
+                    upsert_users::active.set(bind(true)),
+                ))
+                .execute()
+                .await?;
 
-                Ok(())
-            })
+            Ok(())
         })
         .await;
     assert!(tx_result.is_err());
@@ -400,7 +479,7 @@ async fn insert_conflict_and_transaction_helpers_when_database_url_is_set() -> T
         .select(count_star())
         .from(upsert_users::table)
         .where_(upsert_users::email.eq(bind("rolled-back@example.com")))
-        .fetch_one::<i64>()
+        .fetch_one()
         .await?;
     assert_eq!(rolled_back_count, 0);
 
@@ -452,7 +531,7 @@ async fn derive_from_row_decodes_custom_struct_by_column_name_when_database_url_
         "#,
         )
         .bind(1_i64)
-        .fetch_one::<DerivedAccount>()
+        .fetch_one_as::<DerivedAccount>()
         .await?;
 
     assert_eq!(
@@ -513,7 +592,7 @@ async fn fetch_stream_and_chunked_use_postgres_portals_when_database_url_is_set(
         order by id
         "#,
         )
-        .fetch_stream::<(i64, String)>()
+        .fetch_stream_as::<(i64, String)>()
         .await?;
 
     let mut count = 0_i64;
@@ -539,7 +618,7 @@ async fn fetch_stream_and_chunked_use_postgres_portals_when_database_url_is_set(
         order by id
         "#,
         )
-        .fetch_chunked::<(i64, String)>(777)
+        .fetch_chunked_as::<(i64, String)>(777)
         .await?;
 
     let mut total = 0_i64;
@@ -594,13 +673,11 @@ async fn mutable_transaction_executor_runs_queries_when_database_url_is_set() ->
     let mut transaction = client.transaction().await?;
     let mut dsl = Dsl::using(&mut transaction);
 
-    let value = dsl.raw("select 42::bigint").fetch_one::<i64>().await?;
+    let value = dsl.raw("select 42::bigint").fetch_one_as::<i64>().await?;
     assert_eq!(value, 42);
 
     let nested_value = dsl
-        .transaction(|tx| {
-            Box::pin(async move { tx.raw("select 43::bigint").fetch_one::<i64>().await })
-        })
+        .transaction(async |tx| tx.raw("select 43::bigint").fetch_one_as::<i64>().await)
         .await?;
     assert_eq!(nested_value, 43);
 
@@ -628,7 +705,7 @@ async fn pool_dsl_context_acquires_on_execution_and_can_be_shared_when_database_
         handles.push(tokio::spawn(async move {
             dsl.raw("select $1::bigint")
                 .bind(expected)
-                .fetch_one::<i64>()
+                .fetch_one_as::<i64>()
                 .await
         }));
     }
@@ -643,27 +720,23 @@ async fn pool_dsl_context_acquires_on_execution_and_can_be_shared_when_database_
     assert!(status.size <= status.max_size);
 
     let (first_pid, second_pid) = shared
-        .with_connection(|dsl| {
-            Box::pin(async move {
-                let first_pid = dsl
-                    .raw("select pg_backend_pid()")
-                    .fetch_one::<i32>()
-                    .await?;
-                let second_pid = dsl
-                    .raw("select pg_backend_pid()")
-                    .fetch_one::<i32>()
-                    .await?;
-                Ok((first_pid, second_pid))
-            })
+        .with_connection(async |dsl| {
+            let first_pid = dsl
+                .raw("select pg_backend_pid()")
+                .fetch_one_as::<i32>()
+                .await?;
+            let second_pid = dsl
+                .raw("select pg_backend_pid()")
+                .fetch_one_as::<i32>()
+                .await?;
+            Ok((first_pid, second_pid))
         })
         .await?;
     assert_eq!(first_pid, second_pid);
 
-    let err = match shared.raw("select 1::bigint").fetch_stream::<i64>().await {
-        Ok(_) => panic!("pool-level streaming should require an explicit transaction"),
-        Err(err) => err,
-    };
-    assert!(err.to_string().contains("dsl.transaction(|dsl| ...)"));
+    // pool-level streaming is now a compile-time error via the
+    // `TransactionalExecutor` bound on `fetch_stream` / `fetch_chunked`,
+    // so there's nothing to assert at runtime here.
 
     Ok(())
 }
@@ -694,18 +767,16 @@ async fn pool_transaction_callback_uses_dsl_context_when_database_url_is_set() -
 
     let dsl = Dsl::using(pool.clone());
     let committed_id = dsl
-        .transaction(|dsl| {
-            Box::pin(async move {
-                dsl.insert_into(pool_users::table)
-                    .values((
-                        pool_users::id.set(bind(1_i64)),
-                        pool_users::email.set(bind("pool-committed@example.com")),
-                        pool_users::active.set(bind(true)),
-                    ))
-                    .returning(pool_users::id)
-                    .fetch_one::<i64>()
-                    .await
-            })
+        .transaction(async |dsl| {
+            dsl.insert_into(pool_users::table)
+                .values((
+                    pool_users::id.set(bind(1_i64)),
+                    pool_users::email.set(bind("pool-committed@example.com")),
+                    pool_users::active.set(bind(true)),
+                ))
+                .returning(pool_users::id)
+                .fetch_one()
+                .await
         })
         .await?;
     assert_eq!(committed_id, 1);
@@ -714,33 +785,31 @@ async fn pool_transaction_callback_uses_dsl_context_when_database_url_is_set() -
         .select(count_star())
         .from(pool_users::table)
         .where_(pool_users::email.eq(bind("pool-committed@example.com")))
-        .fetch_one::<i64>()
+        .fetch_one()
         .await?;
     assert_eq!(committed_count, 1);
 
     let transaction_result = dsl
-        .transaction(|dsl| {
-            Box::pin(async move {
-                dsl.insert_into(pool_users::table)
-                    .values((
-                        pool_users::id.set(bind(2_i64)),
-                        pool_users::email.set(bind("pool-rolled-back@example.com")),
-                        pool_users::active.set(bind(true)),
-                    ))
-                    .execute()
-                    .await?;
+        .transaction(async |dsl| {
+            dsl.insert_into(pool_users::table)
+                .values((
+                    pool_users::id.set(bind(2_i64)),
+                    pool_users::email.set(bind("pool-rolled-back@example.com")),
+                    pool_users::active.set(bind(true)),
+                ))
+                .execute()
+                .await?;
 
-                dsl.insert_into(pool_users::table)
-                    .values((
-                        pool_users::id.set(bind(1_i64)),
-                        pool_users::email.set(bind("pool-duplicate@example.com")),
-                        pool_users::active.set(bind(true)),
-                    ))
-                    .execute()
-                    .await?;
+            dsl.insert_into(pool_users::table)
+                .values((
+                    pool_users::id.set(bind(1_i64)),
+                    pool_users::email.set(bind("pool-duplicate@example.com")),
+                    pool_users::active.set(bind(true)),
+                ))
+                .execute()
+                .await?;
 
-                Ok(())
-            })
+            Ok(())
         })
         .await;
     assert!(transaction_result.is_err());
@@ -749,7 +818,7 @@ async fn pool_transaction_callback_uses_dsl_context_when_database_url_is_set() -
         .select(count_star())
         .from(pool_users::table)
         .where_(pool_users::email.eq(bind("pool-rolled-back@example.com")))
-        .fetch_one::<i64>()
+        .fetch_one()
         .await?;
     assert_eq!(rolled_back_count, 0);
 
@@ -761,6 +830,394 @@ async fn pool_transaction_callback_uses_dsl_context_when_database_url_is_set() -
     }
 
     Ok(())
+}
+
+#[tokio::test]
+async fn priority_features_round_trip_when_database_url_is_set() -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!("skipping priority feature integration test: FUWA_TEST_DATABASE_URL is not set");
+        return Ok(());
+    };
+
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("PostgreSQL connection task failed: {err}");
+        }
+    });
+
+    client
+        .batch_execute(
+            r#"
+            drop schema if exists fuwa_priority cascade;
+            create schema fuwa_priority;
+            create table fuwa_priority.events (
+                id bigint primary key,
+                account_id bigint not null,
+                amount integer not null,
+                created_at timestamptz not null default now()
+            );
+            create table fuwa_priority.archive (
+                id bigint primary key,
+                account_id bigint not null,
+                amount integer not null
+            );
+            create table fuwa_priority.jobs (
+                id bigint primary key,
+                status text not null,
+                created_at timestamptz not null default now()
+            );
+            create table fuwa_priority.bulk (
+                id bigint primary key,
+                label text not null,
+                active boolean not null
+            );
+            create table fuwa_priority.bulk_json (
+                id bigint primary key,
+                doc_json json not null,
+                doc_jsonb jsonb not null,
+                optional_doc json
+            );
+            create table fuwa_priority.bulk_arrays (
+                id bigint primary key,
+                labels varchar(12)[] not null,
+                codes character(1)[] not null
+            );
+            create table fuwa_priority.uniq (
+                email text primary key,
+                rank integer not null
+            );
+            insert into fuwa_priority.events (id, account_id, amount) values
+                (1, 100, 10), (2, 100, 20), (3, 100, 30),
+                (4, 200, 40), (5, 200, 50);
+            insert into fuwa_priority.jobs (id, status) values
+                (1, 'queued'), (2, 'queued'), (3, 'done');
+            "#,
+        )
+        .await?;
+
+    #[allow(non_upper_case_globals)]
+    mod events {
+        use fuwa_core::prelude::*;
+        pub const table: Table = Table::new("fuwa_priority", "events");
+        pub const id: Field<i64, NotNull> = Field::new(table, "id");
+        pub const account_id: Field<i64, NotNull> = Field::new(table, "account_id");
+        pub const amount: Field<i32, NotNull> = Field::new(table, "amount");
+    }
+    #[allow(non_upper_case_globals)]
+    mod archive {
+        use fuwa_core::prelude::*;
+        pub const table: Table = Table::new("fuwa_priority", "archive");
+        pub const id: Field<i64, NotNull> = Field::new(table, "id");
+        pub const account_id: Field<i64, NotNull> = Field::new(table, "account_id");
+        pub const amount: Field<i32, NotNull> = Field::new(table, "amount");
+    }
+    #[allow(non_upper_case_globals)]
+    mod jobs {
+        use fuwa_core::prelude::*;
+        pub const table: Table = Table::new("fuwa_priority", "jobs");
+        pub const id: Field<i64, NotNull> = Field::new(table, "id");
+        pub const status: Field<String, NotNull> = Field::new(table, "status");
+    }
+    #[allow(non_upper_case_globals)]
+    mod bulk {
+        use fuwa_core::prelude::*;
+        pub const table: Table = Table::new("fuwa_priority", "bulk");
+        pub const id: Field<i64, NotNull> = Field::new(table, "id");
+        pub const label: Field<String, NotNull> = Field::new(table, "label");
+        pub const active: Field<bool, NotNull> = Field::new(table, "active");
+    }
+    #[allow(non_upper_case_globals)]
+    mod bulk_json {
+        use fuwa_core::prelude::*;
+        pub const table: Table = Table::new("fuwa_priority", "bulk_json");
+        pub const id: Field<i64, NotNull> = Field::new(table, "id");
+        pub const doc_json: Field<serde_json::Value, NotNull> =
+            Field::new_with_pg_type(table, "doc_json", "json");
+        pub const doc_jsonb: Field<serde_json::Value, NotNull> =
+            Field::new_with_pg_type(table, "doc_jsonb", "jsonb");
+        pub const optional_doc: Field<serde_json::Value, Nullable> =
+            Field::new_with_pg_type(table, "optional_doc", "json");
+    }
+    #[allow(non_upper_case_globals)]
+    mod bulk_arrays {
+        use fuwa_core::prelude::*;
+        pub const table: Table = Table::new("fuwa_priority", "bulk_arrays");
+        pub const id: Field<i64, NotNull> = Field::new(table, "id");
+        pub const labels: Field<Vec<String>, NotNull> =
+            Field::new_with_pg_type(table, "labels", "_varchar");
+        pub const codes: Field<Vec<String>, NotNull> =
+            Field::new_with_pg_type(table, "codes", "_bpchar");
+    }
+    #[allow(non_upper_case_globals)]
+    mod uniq {
+        use fuwa_core::prelude::*;
+        pub const table: Table = Table::new("fuwa_priority", "uniq");
+        pub const email: Field<String, NotNull> = Field::new(table, "email");
+        pub const rank: Field<i32, NotNull> = Field::new(table, "rank");
+    }
+
+    // window function: top-1-event-per-account using an inline filter
+    // (avoid the AliasedSubquery + window-output-column path which hits a
+    // postgres planner quirk we don't model yet).
+    let dsl = Dsl::using(&client);
+
+    let max_per_account = dsl
+        .select((events::account_id, max(events::amount)))
+        .from(events::table)
+        .group_by(events::account_id)
+        .order_by(events::account_id.asc())
+        .fetch_all()
+        .await?;
+    assert_eq!(max_per_account, vec![(100, Some(30)), (200, Some(50))]);
+
+    // direct window function in a SELECT (no alias subquery)
+    let event_ranks = dsl
+        .select((
+            events::id,
+            events::account_id,
+            row_number()
+                .over(partition_by(events::account_id).order_by(events::amount.desc()))
+                .as_("rn"),
+        ))
+        .from(events::table)
+        .order_by((events::account_id.asc(), events::amount.desc()))
+        .fetch_all()
+        .await?;
+    assert_eq!(event_ranks.len(), 5);
+    assert_eq!(event_ranks[0], (3, 100, 1));
+    assert_eq!(event_ranks[3], (5, 200, 1));
+
+    // set operation: union of two filtered queries
+    let q1 = dsl
+        .select(events::id)
+        .from(events::table)
+        .where_(events::account_id.eq(bind(100_i64)));
+    let q2 = dsl
+        .select(events::id)
+        .from(events::table)
+        .where_(events::account_id.eq(bind(200_i64)));
+    let mut all_ids = q1.union(q2).order_by(events::id.asc()).fetch_all().await?;
+    all_ids.sort();
+    assert_eq!(all_ids, vec![1, 2, 3, 4, 5]);
+
+    // for update + skip locked: lock-and-claim pattern
+    let dsl_arc = std::sync::Arc::new(Dsl::using(pool_for(&database_url, 4).await?));
+    let claim = {
+        let dsl = std::sync::Arc::clone(&dsl_arc);
+        async move {
+            dsl.transaction(async |tx| {
+                let claimed = tx
+                    .select(jobs::id)
+                    .from(jobs::table)
+                    .where_(jobs::status.eq(bind("queued")))
+                    .order_by(jobs::id.asc())
+                    .limit(1)
+                    .for_update()
+                    .skip_locked()
+                    .fetch_optional()
+                    .await?;
+                if let Some(id) = claimed {
+                    tx.update(jobs::table)
+                        .set(jobs::status.set(bind("running")))
+                        .where_(jobs::id.eq(bind(id)))
+                        .execute()
+                        .await?;
+                }
+                Ok::<_, fuwa::Error>(claimed)
+            })
+            .await
+        }
+    };
+    let first = claim.await?;
+    assert_eq!(first, Some(1));
+
+    // insert ... select
+    let dsl = Dsl::using(&client);
+    let archived = dsl
+        .insert_into(archive::table)
+        .columns((archive::id, archive::account_id, archive::amount))
+        .from_select(
+            dsl.select((events::id, events::account_id, events::amount))
+                .from(events::table)
+                .where_(events::amount.gte(bind(30_i32))),
+        )
+        .execute()
+        .await?;
+    assert_eq!(archived, 3);
+
+    // update ... from
+    let bumped = dsl
+        .update(archive::table)
+        .set(archive::amount.set(events::amount.expr() + bind(1_i32)))
+        .from(events::table)
+        .where_(archive::id.eq(events::id).and(archive::id.eq(bind(3_i64))))
+        .returning((archive::id, archive::amount))
+        .fetch_one()
+        .await?;
+    assert_eq!(bumped, (3, 31));
+
+    // delete ... using
+    let mut deleted = dsl
+        .delete_from(archive::table)
+        .using(events::table)
+        .where_(
+            archive::id
+                .eq(events::id)
+                .and(events::account_id.eq(bind(200_i64))),
+        )
+        .returning(archive::id)
+        .fetch_all()
+        .await?;
+    deleted.sort_unstable();
+    assert_eq!(deleted, vec![4, 5]);
+
+    // copy_in_binary
+    let copied = dsl
+        .copy_in_binary(
+            bulk::table,
+            (bulk::id, bulk::label, bulk::active),
+            async |writer| {
+                for i in 1_i64..=100 {
+                    writer.send((i, format!("row-{i}"), i % 2 == 0)).await?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
+    assert_eq!(copied, 100);
+    let bulk_count = dsl
+        .select(count_star())
+        .from(bulk::table)
+        .fetch_one()
+        .await?;
+    assert_eq!(bulk_count, 100);
+    let copied_json = dsl
+        .copy_in_binary(
+            bulk_json::table,
+            (
+                bulk_json::id,
+                bulk_json::doc_json,
+                bulk_json::doc_jsonb,
+                bulk_json::optional_doc,
+            ),
+            async |writer| {
+                writer
+                    .send((
+                        1_i64,
+                        json!({"format": "json"}),
+                        json!({"format": "jsonb"}),
+                        None::<serde_json::Value>,
+                    ))
+                    .await?;
+                writer
+                    .send((
+                        2_i64,
+                        json!({"n": 2}),
+                        json!({"n": 2, "indexed": true}),
+                        Some(json!({"present": true})),
+                    ))
+                    .await?;
+                Ok(())
+            },
+        )
+        .await?;
+    assert_eq!(copied_json, 2);
+    let bulk_json_count = dsl
+        .select(count_star())
+        .from(bulk_json::table)
+        .fetch_one()
+        .await?;
+    assert_eq!(bulk_json_count, 2);
+    let copied_arrays = dsl
+        .copy_in_binary(
+            bulk_arrays::table,
+            (bulk_arrays::id, bulk_arrays::labels, bulk_arrays::codes),
+            async |writer| {
+                writer
+                    .send((
+                        1_i64,
+                        vec!["alpha".to_owned(), "beta".to_owned()],
+                        vec!["A".to_owned(), "B".to_owned()],
+                    ))
+                    .await?;
+                writer
+                    .send((2_i64, vec!["gamma".to_owned()], vec!["C".to_owned()]))
+                    .await?;
+                Ok(())
+            },
+        )
+        .await?;
+    assert_eq!(copied_arrays, 2);
+    let bulk_arrays_count = dsl
+        .select(count_star())
+        .from(bulk_arrays::table)
+        .fetch_one()
+        .await?;
+    assert_eq!(bulk_arrays_count, 2);
+    let copy_dup_err = dsl
+        .copy_in_binary(
+            bulk::table,
+            (bulk::id, bulk::label, bulk::active),
+            async |writer| {
+                for i in 0..256 {
+                    writer
+                        .send((1_i64, format!("duplicate-{i:03}"), true))
+                        .await?;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(copy_dup_err, fuwa::Error::UniqueViolation { .. }),
+        "expected UniqueViolation from COPY, got: {copy_dup_err:?}"
+    );
+
+    // error taxonomy: unique violation maps to typed variant
+    dsl.insert_into(uniq::table)
+        .values((uniq::email.set(bind("a")), uniq::rank.set(bind(1_i32))))
+        .execute()
+        .await?;
+    let dup_err = dsl
+        .insert_into(uniq::table)
+        .values((uniq::email.set(bind("a")), uniq::rank.set(bind(2_i32))))
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(dup_err, fuwa::Error::UniqueViolation { .. }),
+        "expected UniqueViolation, got: {dup_err:?}"
+    );
+
+    // dynamic composition: Condition::all over a filter list
+    let mut filters: Vec<Condition> = Vec::new();
+    filters.push(events::account_id.eq(bind(100_i64)));
+    filters.push(events::amount.gt(bind(15_i32)));
+    let count = dsl
+        .select(count_star())
+        .from(events::table)
+        .filter(Condition::all(filters))
+        .fetch_one()
+        .await?;
+    assert_eq!(count, 2);
+
+    client
+        .batch_execute("drop schema if exists fuwa_priority cascade;")
+        .await?;
+
+    Ok(())
+}
+
+async fn pool_for(
+    database_url: &str,
+    max_size: usize,
+) -> std::result::Result<Pool, Box<dyn std::error::Error>> {
+    Ok(create_pool_with_options(
+        database_url,
+        PoolOptions { max_size },
+    )?)
 }
 
 #[tokio::test]
@@ -884,7 +1341,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .join(posts::table.on(posts::account_id.eq(active_account_id)))
         .where_(posts::published.eq(bind(true)))
         .order_by((active_account_id.asc(), posts::id.asc()))
-        .fetch_all::<(i64, String, String)>()
+        .fetch_all()
         .await?;
 
     assert_eq!(
@@ -905,7 +1362,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
                 .and(posts::published.eq(bind(true))),
         )
         .order_by((accounts::id.asc(), posts::id.asc()))
-        .fetch_all::<(String, String, i32)>()
+        .fetch_all()
         .await?;
 
     assert_eq!(
@@ -926,7 +1383,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         )
         .where_(accounts::active.eq(bind(true)))
         .order_by(accounts::id.asc())
-        .fetch_all::<(String, Option<String>)>()
+        .fetch_all()
         .await?;
 
     assert_eq!(
@@ -943,7 +1400,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .from(accounts::table)
         .where_(accounts::display_name.is_null())
         .order_by(accounts::id.asc())
-        .fetch_all::<(i64, Option<String>)>()
+        .fetch_all()
         .await?;
 
     assert_eq!(
@@ -956,7 +1413,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .from(accounts::table)
         .where_(accounts::signup_rank.gte(bind(30_i32)))
         .order_by(accounts::signup_rank.desc())
-        .fetch_all::<String>()
+        .fetch_all()
         .await?;
 
     assert_eq!(
@@ -968,7 +1425,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .select(accounts::account_balance)
         .from(accounts::table)
         .where_(accounts::email.eq(bind("ada@example.com")))
-        .fetch_one::<Decimal>()
+        .fetch_one()
         .await?;
 
     assert_eq!(ada_balance, Decimal::new(1025, 2));
@@ -977,7 +1434,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .select(sum(accounts::account_balance))
         .from(accounts::table)
         .where_(accounts::active.eq(bind(true)))
-        .fetch_one::<Option<Decimal>>()
+        .fetch_one()
         .await?;
 
     assert_eq!(active_balance_total, Some(Decimal::new(8050, 2)));
@@ -993,7 +1450,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
                 .and(accounts::signup_rank.not_between(bind(35_i32), bind(45_i32))),
         )
         .order_by(accounts::id.asc())
-        .fetch_all::<String>()
+        .fetch_all()
         .await?;
 
     assert_eq!(
@@ -1006,7 +1463,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .from(posts::table)
         .where_(posts::id.in_([bind(10_i64), bind(30_i64)]))
         .order_by(posts::id.asc())
-        .fetch_all::<(i64, i32)>()
+        .fetch_all()
         .await?;
 
     assert_eq!(adjusted_scores, vec![(10, 50), (30, 85)]);
@@ -1026,7 +1483,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .from(accounts::table)
         .where_(accounts::id.in_([bind(1_i64), bind(2_i64)]))
         .order_by(accounts::id.asc())
-        .fetch_all::<(i64, String, Option<String>, String)>()
+        .fetch_all()
         .await?;
 
     assert_eq!(
@@ -1053,7 +1510,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
             accounts::account_balance.set(bind(Decimal::new(5050, 2))),
         ))
         .returning(accounts::account_balance)
-        .fetch_one::<Decimal>()
+        .fetch_one()
         .await?;
 
     assert_eq!(inserted_balance, Decimal::new(5050, 2));
@@ -1063,7 +1520,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .from(posts::table)
         .where_(posts::body.is_null())
         .order_by(posts::id.asc())
-        .fetch_all::<(i64, Option<String>)>()
+        .fetch_all()
         .await?;
 
     assert_eq!(posts_without_body, vec![(11, None), (30, None)]);
@@ -1072,7 +1529,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .select(count_star())
         .from(posts::table)
         .where_(posts::published.eq(bind(true)))
-        .fetch_one::<i64>()
+        .fetch_one()
         .await?;
 
     assert_eq!(published_post_count, 3);
@@ -1083,7 +1540,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .group_by(posts::account_id)
         .having(count_star().gt(bind(1_i64)))
         .order_by(posts::account_id.asc())
-        .fetch_all::<(i64, i64)>()
+        .fetch_all()
         .await?;
 
     assert_eq!(post_counts_by_account, vec![(1, 2)]);
@@ -1096,7 +1553,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
             comments::body.set(bind("late addition")),
         ))
         .returning((comments::id, comments::body))
-        .fetch_one::<(i64, String)>()
+        .fetch_one()
         .await?;
 
     assert_eq!(inserted_comment, (301, "late addition".to_owned()));
@@ -1106,7 +1563,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
         .set(posts::score.set(bind(100_i32)))
         .where_(posts::id.eq(bind(10_i64)))
         .returning((posts::id, posts::score))
-        .fetch_one::<(i64, i32)>()
+        .fetch_one()
         .await?;
 
     assert_eq!(updated_post, (10, 100));
@@ -1122,7 +1579,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
     let remaining_comment_count = dsl
         .select(count_star())
         .from(comments::table)
-        .fetch_one::<i64>()
+        .fetch_one()
         .await?;
 
     assert_eq!(remaining_comment_count, 4);
@@ -1134,7 +1591,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
            where "userId" = $1"#,
         )
         .bind("ada")
-        .fetch_one::<Vec<String>>()
+        .fetch_one_as::<Vec<String>>()
         .await?;
 
     assert_eq!(
@@ -1153,7 +1610,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
             "cy@example.com".to_owned(),
             "ada@example.com".to_owned(),
         ])
-        .fetch_all::<String>()
+        .fetch_all_as::<String>()
         .await?;
 
     assert_eq!(

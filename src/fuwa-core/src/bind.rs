@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use postgres_types::ToSql;
@@ -7,10 +8,14 @@ use uuid::Uuid;
 
 use crate::{Expr, ExprNode, NotNull, Nullable};
 
-/// Owned value stored separately from SQL text and passed to PostgreSQL as a bind.
-pub type BindValue = Box<dyn ToSql + Sync + Send>;
+/// Shared bind value stored separately from SQL text and passed to PostgreSQL as a bind.
+///
+/// Stored in `Arc` so the query AST containing the bind can be cloned for
+/// inspection without moving ownership of the underlying value.
+pub type BindValue = Arc<dyn ToSql + Sync + Send>;
 
-/// A single owned bind parameter.
+/// A single shared bind parameter.
+#[derive(Clone)]
 pub struct BindParam {
     value: BindValue,
 }
@@ -60,6 +65,7 @@ impl_bind_scalar!(
     i16,
     i32,
     i64,
+    u32,
     f32,
     f64,
     bool,
@@ -79,6 +85,16 @@ impl IntoBindValue for &str {
 
     fn into_stored(self) -> Self::Stored {
         self.to_owned()
+    }
+}
+
+impl IntoBindValue for Vec<u8> {
+    type Sql = Vec<u8>;
+    type Nullability = NotNull;
+    type Stored = Vec<u8>;
+
+    fn into_stored(self) -> Self::Stored {
+        self
     }
 }
 
@@ -142,7 +158,7 @@ pub fn bind<T>(value: T) -> Expr<T::Sql, T::Nullability>
 where
     T: IntoBindValue,
 {
-    Expr::from_node(ExprNode::Bind(BindParam::new(Box::new(
+    Expr::from_node(ExprNode::Bind(BindParam::new(Arc::new(
         value.into_stored(),
     ))))
 }

@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
 use crate::{ExprNode, JoinTarget, NotSingleColumn, SelectQuery};
@@ -59,7 +60,7 @@ impl Table {
     /// join, use a nullable source field or create the alias field explicitly
     /// with `field::<T, Nullable>(...)`.
     pub const fn field_of<T, N>(self, source: Field<T, N>) -> Field<T, N> {
-        self.field(source.name())
+        Field::new_with_optional_pg_type(self, source.name(), source.pg_type_name())
     }
 
     /// Create typed fields attached to this table using another field or tuple
@@ -76,10 +77,10 @@ impl Table {
     }
 
     /// Attach an `ON` condition for use with `join` or `left_join`.
-    pub fn on(self, condition: crate::Condition) -> JoinTarget {
+    pub fn on<C: crate::IntoCondition>(self, condition: C) -> JoinTarget {
         JoinTarget {
             source: self.into_table_source(),
-            on: condition,
+            on: condition.into_condition(),
         }
     }
 
@@ -101,12 +102,12 @@ impl Table {
 }
 
 /// A concrete source that can appear in a `FROM` or `JOIN` clause.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TableSourceRef {
     pub(crate) kind: TableSourceKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum TableSourceKind {
     Table(Table),
     Subquery(AliasedSubquery),
@@ -132,13 +133,13 @@ pub trait TableSource {
     fn into_table_source(self) -> TableSourceRef;
 
     /// Attach an `ON` condition for use with `join` or `left_join`.
-    fn on(self, condition: crate::Condition) -> JoinTarget
+    fn on<C: crate::IntoCondition>(self, condition: C) -> JoinTarget
     where
         Self: Sized,
     {
         JoinTarget {
             source: self.into_table_source(),
-            on: condition,
+            on: condition.into_condition(),
         }
     }
 }
@@ -150,7 +151,7 @@ impl TableSource for Table {
 }
 
 /// A `SELECT` query aliased for use as a `FROM` or `JOIN` source.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AliasedSubquery {
     pub(crate) query: Box<SelectQuery<(), NotSingleColumn>>,
     pub(crate) alias: &'static str,
@@ -201,10 +202,11 @@ impl AliasedSubquery {
     fn assert_field_selected<T, N>(&self, source: Field<T, N>) {
         let source_ref = crate::FieldRef::new(source.table(), source.name());
         let selected = self.query.selection.iter().any(|item| {
-            matches!(
-                &item.expr,
-                ExprNode::Field(field) if *field == source_ref
-            )
+            item.alias.is_none()
+                && matches!(
+                    &item.expr,
+                    ExprNode::Field(field) if *field == source_ref
+                )
         });
 
         assert!(
@@ -216,10 +218,10 @@ impl AliasedSubquery {
     }
 
     /// Attach an `ON` condition for use with `join` or `left_join`.
-    pub fn on(self, condition: crate::Condition) -> JoinTarget {
+    pub fn on<C: crate::IntoCondition>(self, condition: C) -> JoinTarget {
         JoinTarget {
             source: self.into_table_source(),
-            on: condition,
+            on: condition.into_condition(),
         }
     }
 
@@ -235,10 +237,11 @@ impl TableSource for AliasedSubquery {
 }
 
 /// A typed field belonging to a table.
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub struct Field<T, N = NotNull> {
     table: Table,
     name: &'static str,
+    pg_type: Option<&'static str>,
     marker: PhantomData<fn() -> (T, N)>,
 }
 
@@ -250,12 +253,41 @@ impl<T, N> Clone for Field<T, N> {
 
 impl<T, N> Copy for Field<T, N> {}
 
+impl<T, N> PartialEq for Field<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.table == other.table && self.name == other.name
+    }
+}
+
+impl<T, N> Eq for Field<T, N> {}
+
+impl<T, N> Hash for Field<T, N> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.table.hash(state);
+        self.name.hash(state);
+    }
+}
+
 impl<T, N> Field<T, N> {
     /// Create a typed field.
     pub const fn new(table: Table, name: &'static str) -> Self {
+        Self::new_with_optional_pg_type(table, name, None)
+    }
+
+    /// Create a typed field with PostgreSQL column type metadata.
+    pub const fn new_with_pg_type(table: Table, name: &'static str, pg_type: &'static str) -> Self {
+        Self::new_with_optional_pg_type(table, name, Some(pg_type))
+    }
+
+    pub(crate) const fn new_with_optional_pg_type(
+        table: Table,
+        name: &'static str,
+        pg_type: Option<&'static str>,
+    ) -> Self {
         Self {
             table,
             name,
+            pg_type,
             marker: PhantomData,
         }
     }
@@ -266,6 +298,10 @@ impl<T, N> Field<T, N> {
 
     pub const fn name(self) -> &'static str {
         self.name
+    }
+
+    pub const fn pg_type_name(self) -> Option<&'static str> {
+        self.pg_type
     }
 }
 

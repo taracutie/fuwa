@@ -252,7 +252,7 @@ fn prisma_schema_generates_compile_checked_module_and_expected_sql() -> TestResu
                             users::role.set(bind(Role::Admin)),
                         ))
                         .returning(users::role)
-                        .fetch_one::<Option<Role>>()
+                        .fetch_one()
                         .await?;
 
                     assert_eq!(inserted_role, Some(Role::Admin));
@@ -261,7 +261,7 @@ fn prisma_schema_generates_compile_checked_module_and_expected_sql() -> TestResu
                         .select(users::all())
                         .from(users::table)
                         .where_(users::role.eq(bind(Role::Admin)))
-                        .fetch_one::<users::Record>()
+                        .fetch_one()
                         .await?;
 
                     assert_eq!(record.role, Some(Role::Admin));

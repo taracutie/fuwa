@@ -1,7 +1,9 @@
 use postgres_types::ToSql;
 
-use crate::expr::InOperandKind;
-use crate::query::{InsertConflict, SelectDistinct};
+use crate::expr::{InOperandKind, WindowFrame, WindowFrameBound, WindowFrameUnit, WindowSpec};
+use crate::query::{
+    ForLock, InsertConflict, LockStrength, LockWait, SelectDistinct, SelectTail, SetOp,
+};
 use crate::table::TableSourceKind;
 use crate::{
     quote_ident, ArithmeticOp, ArrayQuantifier, Assignment, BinaryOp, BindValue, DeleteQuery,
@@ -10,7 +12,7 @@ use crate::{
 };
 
 /// A rendered SQL statement plus owned bind values.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RenderedQuery {
     sql: String,
     binds: Vec<BindValue>,
@@ -38,9 +40,41 @@ impl RenderedQuery {
     }
 }
 
+impl std::fmt::Display for RenderedQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.sql)
+    }
+}
+
 /// Something that can render itself into PostgreSQL SQL and binds.
 pub trait RenderQuery {
     fn render(self) -> Result<RenderedQuery>;
+}
+
+/// A renderable query that knows its row type.
+///
+/// Implemented by every typed query (`SelectQuery`, `InsertQuery` with
+/// `RETURNING`, etc.). Lets generic runners on `DslContext` infer the
+/// decoded row type from the query itself, without an explicit turbofish.
+pub trait Query: RenderQuery {
+    /// The Rust type each result row decodes into.
+    type Row;
+}
+
+impl<R, S> Query for SelectQuery<R, S> {
+    type Row = R;
+}
+
+impl<R> Query for InsertQuery<R> {
+    type Row = R;
+}
+
+impl<R> Query for UpdateQuery<R> {
+    type Row = R;
+}
+
+impl<R> Query for DeleteQuery<R> {
+    type Row = R;
 }
 
 #[derive(Default)]
@@ -61,7 +95,7 @@ impl Renderer {
     }
 
     fn push_i64_bind(&mut self, value: i64) {
-        self.push_bind(Box::new(value));
+        self.push_bind(std::sync::Arc::new(value));
     }
 }
 
@@ -121,6 +155,16 @@ fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Res
         renderer.sql.push(' ');
     }
 
+    let has_set_ops = !query.set_ops.is_empty();
+
+    let set_op_group_start = if has_set_ops {
+        let start = renderer.sql.len();
+        renderer.sql.push('(');
+        Some(start)
+    } else {
+        None
+    };
+
     renderer.sql.push_str("select ");
     if let Some(distinct) = query.distinct {
         render_distinct(distinct, renderer)?;
@@ -156,12 +200,56 @@ fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Res
         )?;
     }
 
-    if !query.order_by.is_empty() {
-        renderer.sql.push_str(" order by ");
-        render_order_by(query.order_by, renderer)?;
+    if let Some(group_start) = set_op_group_start {
+        for (index, set_op) in query.set_ops.into_iter().enumerate() {
+            if index > 0 {
+                renderer.sql.insert(group_start, '(');
+            }
+            let qualification = if index > 0 {
+                FieldQualification::Unqualified
+            } else {
+                FieldQualification::Qualified
+            };
+            render_select_tail(set_op.left_tail, renderer, qualification)?;
+            renderer.sql.push(')');
+            renderer.sql.push(' ');
+            renderer.sql.push_str(set_op_keyword(set_op.op, set_op.all));
+            renderer.sql.push_str(" (");
+            render_select(set_op.query, renderer)?;
+            renderer.sql.push(')');
+        }
     }
 
-    if let Some(limit) = query.limit {
+    let qualification = if has_set_ops {
+        FieldQualification::Unqualified
+    } else {
+        FieldQualification::Qualified
+    };
+    render_select_tail(
+        SelectTail {
+            order_by: query.order_by,
+            limit: query.limit,
+            offset: query.offset,
+            for_lock: query.for_lock,
+        },
+        renderer,
+        qualification,
+    )?;
+
+    Ok(())
+}
+
+fn render_select_tail(
+    tail: SelectTail,
+    renderer: &mut Renderer,
+    qualification: FieldQualification,
+) -> Result<()> {
+    if !tail.order_by.is_empty() {
+        renderer.sql.push_str(" order by ");
+        render_order_by_with_qualification(tail.order_by, renderer, qualification)?;
+    }
+
+    if let Some(limit) = tail.limit {
         if limit < 0 {
             return Err(Error::invalid_query_shape("LIMIT cannot be negative"));
         }
@@ -169,7 +257,7 @@ fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Res
         renderer.push_i64_bind(limit);
     }
 
-    if let Some(offset) = query.offset {
+    if let Some(offset) = tail.offset {
         if offset < 0 {
             return Err(Error::invalid_query_shape("OFFSET cannot be negative"));
         }
@@ -177,6 +265,55 @@ fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Res
         renderer.push_i64_bind(offset);
     }
 
+    if let Some(for_lock) = tail.for_lock {
+        render_for_lock(for_lock, renderer)?;
+    }
+
+    Ok(())
+}
+
+fn set_op_keyword(op: SetOp, all: bool) -> &'static str {
+    match (op, all) {
+        (SetOp::Union, false) => "union",
+        (SetOp::Union, true) => "union all",
+        (SetOp::Except, false) => "except",
+        (SetOp::Except, true) => "except all",
+        (SetOp::Intersect, false) => "intersect",
+        (SetOp::Intersect, true) => "intersect all",
+    }
+}
+
+fn render_for_lock(lock: ForLock, renderer: &mut Renderer) -> Result<()> {
+    renderer.sql.push_str(match lock.strength {
+        LockStrength::Update => " for update",
+        LockStrength::NoKeyUpdate => " for no key update",
+        LockStrength::Share => " for share",
+        LockStrength::KeyShare => " for key share",
+    });
+
+    if !lock.of.is_empty() {
+        renderer.sql.push_str(" of ");
+        for (index, table) in lock.of.into_iter().enumerate() {
+            if index > 0 {
+                renderer.sql.push_str(", ");
+            }
+            render_lock_target(table, renderer)?;
+        }
+    }
+
+    match lock.wait {
+        LockWait::Wait => {}
+        LockWait::NoWait => renderer.sql.push_str(" nowait"),
+        LockWait::SkipLocked => renderer.sql.push_str(" skip locked"),
+    }
+
+    Ok(())
+}
+
+fn render_lock_target(table: Table, renderer: &mut Renderer) -> Result<()> {
+    renderer
+        .sql
+        .push_str(&quote_ident(table.alias().unwrap_or_else(|| table.name()))?);
     Ok(())
 }
 
@@ -200,6 +337,58 @@ fn render_distinct(distinct: SelectDistinct, renderer: &mut Renderer) -> Result<
 }
 
 fn render_insert<R>(query: InsertQuery<R>, renderer: &mut Renderer) -> Result<()> {
+    if let Some(select_source) = query.select_source {
+        if query.insert_columns.is_empty() {
+            return Err(Error::invalid_query_shape(
+                "INSERT ... SELECT requires .columns(...) before .from_select(...)",
+            ));
+        }
+        if !query.rows.is_empty() {
+            return Err(Error::invalid_query_shape(
+                "INSERT cannot combine .values(...) with .from_select(...)",
+            ));
+        }
+        for column in &query.insert_columns {
+            if !column.table().same_identity(query.table) {
+                return Err(Error::invalid_query_shape(format!(
+                    "insert column {} does not belong to target table {}",
+                    column.name(),
+                    query.table.name()
+                )));
+            }
+        }
+        if query.insert_columns.len() != select_source.selection.len() {
+            return Err(Error::invalid_query_shape(format!(
+                "INSERT ... SELECT column count mismatch: {} target columns but {} selected expressions",
+                query.insert_columns.len(),
+                select_source.selection.len()
+            )));
+        }
+
+        renderer.sql.push_str("insert into ");
+        render_table(query.table, renderer)?;
+        renderer.sql.push_str(" (");
+        for (index, column) in query.insert_columns.iter().enumerate() {
+            if index > 0 {
+                renderer.sql.push_str(", ");
+            }
+            renderer.sql.push_str(&quote_ident(column.name())?);
+        }
+        renderer.sql.push_str(") ");
+        render_select(select_source, renderer)?;
+
+        if let Some(on_conflict) = query.on_conflict {
+            render_insert_conflict(query.table, on_conflict, renderer)?;
+        }
+
+        if !query.returning.is_empty() {
+            renderer.sql.push_str(" returning ");
+            render_select_items(query.returning, renderer, FieldQualification::Unqualified)?;
+        }
+
+        return Ok(());
+    }
+
     if query.rows.is_empty() {
         return Err(Error::invalid_query_shape(
             "INSERT requires at least one value",
@@ -323,6 +512,11 @@ fn render_update<R>(query: UpdateQuery<R>, renderer: &mut Renderer) -> Result<()
         ));
     }
     validate_assignments_target(query.table, &query.assignments)?;
+    let returning_qualification = if query.from.is_some() {
+        FieldQualification::Qualified
+    } else {
+        FieldQualification::Unqualified
+    };
 
     renderer.sql.push_str("update ");
     render_table(query.table, renderer)?;
@@ -338,6 +532,11 @@ fn render_update<R>(query: UpdateQuery<R>, renderer: &mut Renderer) -> Result<()
         render_expr(assignment.value, renderer, FieldQualification::Qualified)?;
     }
 
+    if let Some(from) = query.from {
+        renderer.sql.push_str(" from ");
+        render_table_source(from, renderer)?;
+    }
+
     if let Some(condition) = query.where_clause {
         renderer.sql.push_str(" where ");
         render_expr(
@@ -349,15 +548,26 @@ fn render_update<R>(query: UpdateQuery<R>, renderer: &mut Renderer) -> Result<()
 
     if !query.returning.is_empty() {
         renderer.sql.push_str(" returning ");
-        render_select_items(query.returning, renderer, FieldQualification::Unqualified)?;
+        render_select_items(query.returning, renderer, returning_qualification)?;
     }
 
     Ok(())
 }
 
 fn render_delete<R>(query: DeleteQuery<R>, renderer: &mut Renderer) -> Result<()> {
+    let returning_qualification = if query.using.is_some() {
+        FieldQualification::Qualified
+    } else {
+        FieldQualification::Unqualified
+    };
+
     renderer.sql.push_str("delete from ");
     render_table(query.table, renderer)?;
+
+    if let Some(using) = query.using {
+        renderer.sql.push_str(" using ");
+        render_table_source(using, renderer)?;
+    }
 
     if let Some(condition) = query.where_clause {
         renderer.sql.push_str(" where ");
@@ -370,7 +580,7 @@ fn render_delete<R>(query: DeleteQuery<R>, renderer: &mut Renderer) -> Result<()
 
     if !query.returning.is_empty() {
         renderer.sql.push_str(" returning ");
-        render_select_items(query.returning, renderer, FieldQualification::Unqualified)?;
+        render_select_items(query.returning, renderer, returning_qualification)?;
     }
 
     Ok(())
@@ -437,6 +647,10 @@ fn render_select_items(
             renderer.sql.push_str(", ");
         }
         render_expr(item.expr, renderer, qualification)?;
+        if let Some(alias) = item.alias {
+            renderer.sql.push_str(" as ");
+            renderer.sql.push_str(&quote_ident(alias)?);
+        }
     }
     Ok(())
 }
@@ -460,18 +674,31 @@ fn render_join(join: Join, renderer: &mut Renderer) -> Result<()> {
     match join.kind {
         JoinKind::Inner => renderer.sql.push_str("join "),
         JoinKind::Left => renderer.sql.push_str("left join "),
+        JoinKind::Right => renderer.sql.push_str("right join "),
+        JoinKind::Full => renderer.sql.push_str("full join "),
+        JoinKind::Cross => renderer.sql.push_str("cross join "),
+    }
+    if join.lateral {
+        renderer.sql.push_str("lateral ");
     }
     render_table_source(join.source, renderer)?;
-    renderer.sql.push_str(" on ");
-    render_expr(join.on.into_node(), renderer, FieldQualification::Qualified)
+    if let Some(on) = join.on {
+        renderer.sql.push_str(" on ");
+        render_expr(on.into_node(), renderer, FieldQualification::Qualified)?;
+    }
+    Ok(())
 }
 
-fn render_order_by(order_by: Vec<OrderExpr>, renderer: &mut Renderer) -> Result<()> {
+fn render_order_by_with_qualification(
+    order_by: Vec<OrderExpr>,
+    renderer: &mut Renderer,
+    qualification: FieldQualification,
+) -> Result<()> {
     for (index, order) in order_by.into_iter().enumerate() {
         if index > 0 {
             renderer.sql.push_str(", ");
         }
-        render_expr(order.expr, renderer, FieldQualification::Qualified)?;
+        render_expr(order.expr, renderer, qualification)?;
         renderer.sql.push(' ');
         renderer.sql.push_str(match order.direction {
             OrderDirection::Asc => "asc",
@@ -766,11 +993,143 @@ fn render_expr_with_context(
             renderer.sql.push_str(" end)");
             Ok(())
         }
+        ExprNode::Window { func, spec } => {
+            render_expr_with_context(*func, renderer, context)?;
+            render_window_spec(*spec, renderer, context)?;
+            Ok(())
+        }
+        ExprNode::Exists { query, negated } => {
+            if negated {
+                renderer.sql.push_str("not exists (");
+            } else {
+                renderer.sql.push_str("exists (");
+            }
+            render_select(*query, renderer)?;
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::Cast { expr, sql_type } => {
+            renderer.sql.push_str("cast(");
+            render_expr_with_context(*expr, renderer, context)?;
+            renderer.sql.push_str(" as ");
+            renderer.sql.push_str(sql_type);
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::DateTrunc { field, expr } => {
+            renderer.sql.push_str("date_trunc(");
+            render_sql_string_literal(field, renderer);
+            renderer.sql.push_str(", ");
+            render_expr_with_context(*expr, renderer, context)?;
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::Extract { field, expr } => {
+            renderer.sql.push_str("extract(");
+            renderer.sql.push_str(field);
+            renderer.sql.push_str(" from ");
+            render_expr_with_context(*expr, renderer, context)?;
+            renderer.sql.push(')');
+            Ok(())
+        }
+        ExprNode::Bool(value) => {
+            renderer.sql.push_str(if value { "true" } else { "false" });
+            Ok(())
+        }
         ExprNode::Star => {
             renderer.sql.push('*');
             Ok(())
         }
     }
+}
+
+fn render_window_spec(
+    spec: WindowSpec,
+    renderer: &mut Renderer,
+    context: ExprRenderContext,
+) -> Result<()> {
+    renderer.sql.push_str(" over (");
+    let mut needs_space = false;
+
+    if !spec.partition_by.is_empty() {
+        renderer.sql.push_str("partition by ");
+        for (index, expr) in spec.partition_by.into_iter().enumerate() {
+            if index > 0 {
+                renderer.sql.push_str(", ");
+            }
+            render_expr_with_context(expr, renderer, context)?;
+        }
+        needs_space = true;
+    }
+
+    if !spec.order_by.is_empty() {
+        if needs_space {
+            renderer.sql.push(' ');
+        }
+        renderer.sql.push_str("order by ");
+        for (index, order) in spec.order_by.into_iter().enumerate() {
+            if index > 0 {
+                renderer.sql.push_str(", ");
+            }
+            render_expr_with_context(order.expr, renderer, context)?;
+            renderer.sql.push(' ');
+            renderer.sql.push_str(match order.direction {
+                OrderDirection::Asc => "asc",
+                OrderDirection::Desc => "desc",
+            });
+        }
+        needs_space = true;
+    }
+
+    if let Some(frame) = spec.frame {
+        if needs_space {
+            renderer.sql.push(' ');
+        }
+        render_window_frame(frame, renderer);
+    }
+
+    renderer.sql.push(')');
+    Ok(())
+}
+
+fn render_window_frame(frame: WindowFrame, renderer: &mut Renderer) {
+    renderer.sql.push_str(match frame.unit {
+        WindowFrameUnit::Rows => "rows",
+        WindowFrameUnit::Range => "range",
+        WindowFrameUnit::Groups => "groups",
+    });
+    renderer.sql.push_str(" between ");
+    render_window_bound(frame.start, renderer);
+    renderer.sql.push_str(" and ");
+    render_window_bound(frame.end, renderer);
+}
+
+fn render_window_bound(bound: WindowFrameBound, renderer: &mut Renderer) {
+    match bound {
+        WindowFrameBound::UnboundedPreceding => renderer.sql.push_str("unbounded preceding"),
+        WindowFrameBound::Preceding(n) => {
+            renderer.sql.push_str(&n.to_string());
+            renderer.sql.push_str(" preceding");
+        }
+        WindowFrameBound::CurrentRow => renderer.sql.push_str("current row"),
+        WindowFrameBound::Following(n) => {
+            renderer.sql.push_str(&n.to_string());
+            renderer.sql.push_str(" following");
+        }
+        WindowFrameBound::UnboundedFollowing => renderer.sql.push_str("unbounded following"),
+    }
+}
+
+fn render_sql_string_literal(value: &str, renderer: &mut Renderer) {
+    renderer.sql.push('\'');
+    for c in value.chars() {
+        if c == '\'' {
+            renderer.sql.push_str("''");
+        } else {
+            renderer.sql.push(c);
+        }
+    }
+    renderer.sql.push('\'');
 }
 
 fn binary_op_sql(op: BinaryOp) -> &'static str {
@@ -826,10 +1185,12 @@ mod tests {
         pub const display_name: Field<String, Nullable> = Field::new(table, "display_name");
         pub const active: Field<bool, NotNull> = Field::new(table, "active");
         pub const signup_rank: Field<i32, NotNull> = Field::new(table, "signup_rank");
+        pub const oid: Field<u32, NotNull> = Field::new(table, "oid");
         pub const ratio: Field<f32, NotNull> = Field::new(table, "ratio");
         pub const created_at: Field<i64, NotNull> = Field::new(table, "created_at");
         pub const profile: Field<serde_json::Value, Nullable> = Field::new(table, "profile");
         pub const tags: Field<Vec<String>, NotNull> = Field::new(table, "tags");
+        pub const oid_history: Field<Vec<u32>, NotNull> = Field::new(table, "oid_history");
     }
 
     #[allow(non_upper_case_globals)]
@@ -840,6 +1201,15 @@ mod tests {
         pub const id: Field<i64, NotNull> = Field::new(table, "id");
         pub const user_id: Field<i64, NotNull> = Field::new(table, "user_id");
         pub const title: Field<String, NotNull> = Field::new(table, "title");
+    }
+
+    #[allow(non_upper_case_globals)]
+    mod events {
+        use crate::prelude::*;
+
+        pub const table: Table = Table::new("public", "events");
+        pub const occurred_at: Field<chrono::NaiveDateTime, NotNull> =
+            Field::new(table, "occurred_at");
     }
 
     #[allow(non_upper_case_globals)]
@@ -1030,32 +1400,27 @@ mod tests {
     fn renders_jsonb_operators() {
         fn assert_expr_type<T, N>(_: Expr<T, N>) {}
 
-        assert_expr_type::<serde_json::Value, Nullable>(users::profile.expr().json_get("role"));
-        assert_expr_type::<String, Nullable>(users::profile.expr().json_get_text("role"));
+        assert_expr_type::<serde_json::Value, Nullable>(users::profile.json_get("role"));
+        assert_expr_type::<String, Nullable>(users::profile.json_get_text("role"));
         assert_expr_type::<serde_json::Value, Nullable>(
-            users::profile.expr().json_path(vec!["settings", "theme"]),
+            users::profile.json_path(vec!["settings", "theme"]),
         );
         assert_expr_type::<String, Nullable>(
-            users::profile
-                .expr()
-                .json_path_text(&["settings", "locale"][..]),
+            users::profile.json_path_text(&["settings", "locale"][..]),
         );
 
         let query = Context::new()
             .select((
-                users::profile.expr().json_get("role"),
-                users::profile.expr().json_get_text("role"),
-                users::profile.expr().json_path(vec!["settings", "theme"]),
-                users::profile
-                    .expr()
-                    .json_path_text(&["settings", "locale"][..]),
+                users::profile.json_get("role"),
+                users::profile.json_get_text("role"),
+                users::profile.json_path(vec!["settings", "theme"]),
+                users::profile.json_path_text(&["settings", "locale"][..]),
             ))
             .from(users::table)
             .where_(
                 users::profile
-                    .expr()
                     .contains(serde_json::json!({ "role": "admin" }))
-                    .and(users::profile.expr().has_key("role")),
+                    .and(users::profile.has_key("role")),
             )
             .render()
             .unwrap();
@@ -1077,23 +1442,18 @@ mod tests {
     fn renders_array_operators_and_quantified_comparisons() {
         fn assert_expr_type<T, N>(_: Expr<T, N>) {}
 
-        assert_expr_type::<Vec<String>, NotNull>(users::tags.expr().concat(vec!["new"]));
+        assert_expr_type::<Vec<String>, NotNull>(users::tags.concat(vec!["new"]));
         assert_expr_type::<Vec<String>, Nullable>(nullable(users::tags).concat(vec!["new"]));
 
         let query = Context::new()
-            .select(users::tags.expr().concat(vec!["vip"]))
+            .select(users::tags.concat(vec!["vip"]))
             .from(users::table)
             .where_(
                 users::tags
-                    .expr()
                     .contains(vec!["admin", "staff"])
-                    .and(users::tags.expr().overlaps(vec!["vip", "new"]))
-                    .and(
-                        users::email
-                            .expr()
-                            .eq_any(vec!["ada@example.com", "ben@example.com"]),
-                    )
-                    .and(users::signup_rank.expr().eq_all(vec![1_i32, 2_i32])),
+                    .and(users::tags.overlaps(vec!["vip", "new"]))
+                    .and(users::email.eq_any(vec!["ada@example.com", "ben@example.com"]))
+                    .and(users::signup_rank.eq_all(vec![1_i32, 2_i32])),
             )
             .render()
             .unwrap();
@@ -1109,6 +1469,36 @@ mod tests {
             )
         );
         assert_eq!(query.binds().len(), 5);
+    }
+
+    #[test]
+    fn renders_oid_array_helpers_and_aggregate_type() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<Vec<u32>, Nullable>(array_agg(users::oid));
+
+        let query = Context::new()
+            .select(array_agg(users::oid))
+            .from(users::table)
+            .where_(
+                users::oid
+                    .eq_any(vec![1_u32, 2_u32])
+                    .and(users::oid_history.contains(vec![1_u32]))
+                    .and(users::oid_history.overlaps(vec![2_u32])),
+            )
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select array_agg("users"."oid") from "public"."users" "#,
+                r#"where ((("users"."oid" = any($1)) and "#,
+                r#"("users"."oid_history" @> $2)) and "#,
+                r#"("users"."oid_history" && $3))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 3);
     }
 
     #[test]
@@ -1272,9 +1662,37 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "field_of source field `id` is not selected by subquery alias `u`"
-    )]
+    #[should_panic(expected = "field_of source field `id` is not selected by subquery alias `u`")]
+    fn aliased_subquery_field_of_rejects_renamed_source_field() {
+        let subquery = Context::new()
+            .select(users::id.as_("uid"))
+            .from(users::table)
+            .alias("u");
+
+        let _ = subquery.field_of(users::id);
+    }
+
+    #[test]
+    fn aliased_subquery_field_can_access_renamed_source_field_explicitly() {
+        let subquery = Context::new()
+            .select(users::id.as_("uid"))
+            .from(users::table)
+            .alias("u");
+        let uid: Field<i64, NotNull> = subquery.field("uid");
+
+        let query = Context::new().select(uid).from(subquery).render().unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "u"."uid" from "#,
+                r#"(select "users"."id" as "uid" from "public"."users") as "u""#
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "field_of source field `id` is not selected by subquery alias `u`")]
     fn aliased_subquery_field_of_rejects_same_named_source_field_from_another_table() {
         let accounts = Table::new("public", "accounts");
         let account_id: Field<String, Nullable> = accounts.field("id");
@@ -1907,6 +2325,867 @@ mod tests {
         assert_eq!(
             query.sql(),
             r#"select sum("users"."signup_rank") from "public"."users""#
+        );
+    }
+
+    #[test]
+    fn renders_row_number_with_partition_and_order() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<i64, NotNull>(
+            row_number().over(partition_by(posts::user_id).order_by(posts::id.desc())),
+        );
+
+        let query = Context::new()
+            .select((
+                posts::id,
+                row_number()
+                    .over(partition_by(posts::user_id).order_by(posts::id.desc()))
+                    .as_("rn"),
+            ))
+            .from(posts::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "posts"."id", row_number() over ("#,
+                r#"partition by "posts"."user_id" order by "posts"."id" desc) as "rn" "#,
+                r#"from "blog"."posts""#
+            )
+        );
+    }
+
+    #[test]
+    fn renders_running_total_with_rows_frame() {
+        let query = Context::new()
+            .select((
+                users::id,
+                sum(users::signup_rank)
+                    .over(
+                        partition_by(users::active)
+                            .order_by(users::created_at.asc())
+                            .rows_between(unbounded_preceding(), current_row()),
+                    )
+                    .as_("running_total"),
+            ))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id", sum("users"."signup_rank") over ("#,
+                r#"partition by "users"."active" order by "users"."created_at" asc "#,
+                r#"rows between unbounded preceding and current row) as "running_total" "#,
+                r#"from "public"."users""#
+            )
+        );
+    }
+
+    #[test]
+    fn renders_lag_lead_first_value_last_value_ntile() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<i32, Nullable>(
+            lag(users::signup_rank).over(WindowSpec::new().order_by(users::id.asc())),
+        );
+        assert_expr_type::<i32, Nullable>(
+            lead(users::signup_rank).over(WindowSpec::new().order_by(users::id.asc())),
+        );
+        assert_expr_type::<i32, Nullable>(
+            first_value(users::signup_rank).over(WindowSpec::new().order_by(users::id.asc())),
+        );
+        assert_expr_type::<i32, Nullable>(
+            last_value(users::signup_rank).over(WindowSpec::new().order_by(users::id.asc())),
+        );
+        assert_expr_type::<i32, NotNull>(
+            ntile(4).over(WindowSpec::new().order_by(users::id.asc())),
+        );
+
+        let query = Context::new()
+            .select((
+                lag(users::signup_rank)
+                    .over(WindowSpec::new().order_by(users::id.asc()))
+                    .as_("prev"),
+                lead(users::signup_rank)
+                    .over(WindowSpec::new().order_by(users::id.asc()))
+                    .as_("next"),
+                ntile(4)
+                    .over(WindowSpec::new().order_by(users::id.asc()))
+                    .as_("quartile"),
+            ))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select lag("users"."signup_rank") over ("#,
+                r#"order by "users"."id" asc) as "prev", "#,
+                r#"lead("users"."signup_rank") over ("#,
+                r#"order by "users"."id" asc) as "next", "#,
+                r#"ntile($1) over ("#,
+                r#"order by "users"."id" asc) as "quartile" from "public"."users""#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn renders_exists_and_not_exists_predicates() {
+        let inner = Context::new()
+            .select(posts::id)
+            .from(posts::table)
+            .where_(posts::user_id.eq(users::id));
+
+        let query = Context::new()
+            .select(users::email)
+            .from(users::table)
+            .where_(exists(inner))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."email" from "public"."users" "#,
+                r#"where exists (select "posts"."id" from "blog"."posts" "#,
+                r#"where ("posts"."user_id" = "users"."id"))"#
+            )
+        );
+
+        let inner = Context::new()
+            .select(posts::id)
+            .from(posts::table)
+            .where_(posts::user_id.eq(users::id));
+
+        let query = Context::new()
+            .select(users::email)
+            .from(users::table)
+            .where_(not_exists(inner))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."email" from "public"."users" "#,
+                r#"where not exists (select "posts"."id" from "blog"."posts" "#,
+                r#"where ("posts"."user_id" = "users"."id"))"#
+            )
+        );
+    }
+
+    #[test]
+    fn renders_cast_extract_and_date_trunc_helpers() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<String, NotNull>(cast::<i32, String, _>(users::signup_rank));
+        assert_expr_type::<rust_decimal::Decimal, NotNull>(extract("year", events::occurred_at));
+        assert_expr_type::<chrono::NaiveDateTime, NotNull>(date_trunc("day", events::occurred_at));
+
+        let query = Context::new()
+            .select((
+                cast::<i32, String, _>(users::signup_rank).as_("rank_str"),
+                extract("year", events::occurred_at).as_("year"),
+                date_trunc("day", events::occurred_at).as_("day"),
+            ))
+            .from(users::table)
+            .cross_join(events::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select cast("users"."signup_rank" as text) as "rank_str", "#,
+                r#"extract(year from "events"."occurred_at") as "year", "#,
+                r#"date_trunc('day', "events"."occurred_at") as "day" "#,
+                r#"from "public"."users" cross join "public"."events""#
+            )
+        );
+        assert_eq!(query.binds().len(), 0);
+    }
+
+    #[test]
+    fn renders_reused_date_trunc_group_by_without_duplicate_binds() {
+        let bucket = date_trunc("day", events::occurred_at);
+
+        let query = Context::new()
+            .select((bucket.clone().as_("day"), count_star()))
+            .from(events::table)
+            .group_by(bucket)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select date_trunc('day', "events"."occurred_at") as "day", count(*) "#,
+                r#"from "public"."events" "#,
+                r#"group by date_trunc('day', "events"."occurred_at")"#
+            )
+        );
+        assert_eq!(query.binds().len(), 0);
+    }
+
+    #[test]
+    fn renders_greatest_least_length_lower_upper_trim_now() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<i32, NotNull>(greatest((users::signup_rank, users::signup_rank)));
+        assert_expr_type::<i32, NotNull>(least((users::signup_rank, users::signup_rank)));
+        assert_expr_type::<i32, NotNull>(length(users::email));
+        assert_expr_type::<String, NotNull>(lower(users::email));
+        assert_expr_type::<String, NotNull>(upper(users::email));
+        assert_expr_type::<String, NotNull>(trim(users::email));
+
+        let query = Context::new()
+            .select((
+                greatest((users::signup_rank, users::signup_rank)).as_("g"),
+                least((users::signup_rank, users::signup_rank)).as_("l"),
+                length(users::email).as_("len"),
+                lower(users::email).as_("lo"),
+                upper(users::email).as_("up"),
+                trim(users::email).as_("tr"),
+                now().as_("ts"),
+            ))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select greatest("users"."signup_rank", "users"."signup_rank") as "g", "#,
+                r#"least("users"."signup_rank", "users"."signup_rank") as "l", "#,
+                r#"length("users"."email") as "len", "#,
+                r#"lower("users"."email") as "lo", "#,
+                r#"upper("users"."email") as "up", "#,
+                r#"trim("users"."email") as "tr", "#,
+                r#"now() as "ts" from "public"."users""#
+            )
+        );
+    }
+
+    #[test]
+    fn renders_right_full_cross_joins_and_lateral() {
+        let query = Context::new()
+            .select((users::id, posts::title))
+            .from(users::table)
+            .right_join(posts::table.on(posts::user_id.eq(users::id)))
+            .full_join(posts::table.on(posts::user_id.eq(users::id)))
+            .cross_join(posts::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id", "posts"."title" from "public"."users" "#,
+                r#"right join "blog"."posts" on ("posts"."user_id" = "users"."id") "#,
+                r#"full join "blog"."posts" on ("posts"."user_id" = "users"."id") "#,
+                r#"cross join "blog"."posts""#
+            )
+        );
+
+        let lateral_subquery = Context::new()
+            .select(posts::title)
+            .from(posts::table)
+            .where_(posts::user_id.eq(users::id))
+            .order_by(posts::id.desc())
+            .limit(1)
+            .alias("latest");
+        let latest_title = lateral_subquery.field_of(posts::title);
+
+        let query = Context::new()
+            .select((users::id, latest_title))
+            .from(users::table)
+            .left_join_lateral(lateral_subquery.on(bind(true).eq(bind(true))))
+            .render()
+            .unwrap();
+
+        assert!(query.sql().contains("left join lateral"));
+
+        let cross_lateral = Context::new()
+            .select(posts::title)
+            .from(posts::table)
+            .where_(posts::user_id.eq(users::id))
+            .alias("latest");
+        let cross_title = cross_lateral.field_of(posts::title);
+
+        let query = Context::new()
+            .select((users::id, cross_title))
+            .from(users::table)
+            .cross_join_lateral(cross_lateral)
+            .render()
+            .unwrap();
+
+        assert!(query.sql().contains("cross join lateral"));
+    }
+
+    #[test]
+    fn renders_union_union_all_except_intersect() {
+        let q1 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::active.eq(bind(true)));
+        let q2 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::signup_rank.gt(bind(10_i32)));
+
+        let union = q1.union(q2).render().unwrap();
+        assert_eq!(
+            union.sql(),
+            concat!(
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."active" = $1)) union "#,
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."signup_rank" > $2))"#
+            )
+        );
+
+        let q1 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::active.eq(bind(true)));
+        let q2 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::signup_rank.gt(bind(10_i32)));
+        let union_all = q1
+            .union_all(q2)
+            .order_by(users::id.asc())
+            .limit(20)
+            .render()
+            .unwrap();
+        assert!(union_all.sql().contains("union all"));
+        assert!(union_all.sql().ends_with("limit $3"));
+
+        let q1 = Context::new().select(users::id).from(users::table);
+        let q2 = Context::new().select(users::id).from(users::table);
+        let except = q1.except(q2).render().unwrap();
+        assert!(except.sql().contains("except"));
+
+        let q1 = Context::new().select(users::id).from(users::table);
+        let q2 = Context::new().select(users::id).from(users::table);
+        let intersect = q1.intersect_all(q2).render().unwrap();
+        assert!(intersect.sql().contains("intersect all"));
+    }
+
+    #[test]
+    fn set_operations_preserve_left_operand_tail_clauses() {
+        let q1 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::active.eq(bind(true)))
+            .order_by(users::id.desc())
+            .limit(1)
+            .offset(2);
+        let q2 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::signup_rank.gt(bind(10_i32)));
+
+        let query = q1.union(q2).render().unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."active" = $1) order by "users"."id" desc "#,
+                r#"limit $2 offset $3) union "#,
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."signup_rank" > $4))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 4);
+    }
+
+    #[test]
+    fn set_operation_outer_tail_still_applies_to_combined_set() {
+        let q1 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::active.eq(bind(true)));
+        let q2 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::signup_rank.gt(bind(10_i32)));
+
+        let query = q1
+            .union(q2)
+            .order_by(users::id.asc())
+            .limit(20)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."active" = $1)) union "#,
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."signup_rank" > $2)) "#,
+                r#"order by "id" asc limit $3"#
+            )
+        );
+        assert_eq!(query.binds().len(), 3);
+    }
+
+    #[test]
+    fn renders_mixed_set_operations_left_associative() {
+        let q1 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::id.eq(bind(1_i64)));
+        let q2 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::id.eq(bind(2_i64)));
+        let q3 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::id.eq(bind(3_i64)));
+
+        let query = q1.union(q2).intersect(q3).render().unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"((select "users"."id" from "public"."users" "#,
+                r#"where ("users"."id" = $1)) union "#,
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."id" = $2))) intersect "#,
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."id" = $3))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 3);
+    }
+
+    #[test]
+    fn set_operations_preserve_tail_before_next_set_operation() {
+        let q1 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::id.eq(bind(1_i64)));
+        let q2 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::id.eq(bind(2_i64)));
+        let q3 = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::id.eq(bind(3_i64)));
+
+        let query = q1
+            .union(q2)
+            .order_by(users::id.asc())
+            .limit(2)
+            .intersect(q3)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"((select "users"."id" from "public"."users" "#,
+                r#"where ("users"."id" = $1)) union "#,
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."id" = $2)) order by "id" asc limit $3) intersect "#,
+                r#"(select "users"."id" from "public"."users" "#,
+                r#"where ("users"."id" = $4))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 4);
+    }
+
+    #[test]
+    fn renders_for_update_and_skip_locked() {
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::active.eq(bind(true)))
+            .order_by(users::id.asc())
+            .limit(1)
+            .for_update()
+            .skip_locked()
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id" from "public"."users" "#,
+                r#"where ("users"."active" = $1) "#,
+                r#"order by "users"."id" asc limit $2 for update skip locked"#
+            )
+        );
+
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .for_share()
+            .no_wait()
+            .render()
+            .unwrap();
+
+        assert!(query.sql().contains("for share"));
+        assert!(query.sql().contains("nowait"));
+
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .for_no_key_update()
+            .of(users::table)
+            .render()
+            .unwrap();
+
+        assert!(query.sql().contains("for no key update"));
+        assert!(query.sql().contains(r#"of "users""#));
+
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table.as_("u"))
+            .for_update()
+            .of(users::table.as_("u"))
+            .render()
+            .unwrap();
+
+        assert!(query.sql().contains(r#"from "public"."users" as "u""#));
+        assert!(query.sql().contains(r#"for update of "u""#));
+
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .for_key_share()
+            .render()
+            .unwrap();
+        assert!(query.sql().contains("for key share"));
+    }
+
+    #[test]
+    fn renders_insert_select_form() {
+        let source = Context::new()
+            .select((users::id, users::email))
+            .from(users::table)
+            .where_(users::active.eq(bind(true)));
+
+        let query = Context::new()
+            .insert_into(users::table)
+            .columns((users::id, users::email))
+            .from_select(source)
+            .returning(users::id)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"insert into "public"."users" ("id", "email") "#,
+                r#"select "users"."id", "users"."email" from "public"."users" "#,
+                r#"where ("users"."active" = $1) returning "id""#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn insert_select_requires_matching_column_count() {
+        let source = Context::new().select(users::id).from(users::table);
+        let result = Context::new()
+            .insert_into(users::table)
+            .columns((users::id, users::email))
+            .from_select(source)
+            .render();
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidQueryShape(message))
+                if message.contains("column count mismatch")
+                    && message.contains("2 target columns")
+                    && message.contains("1 selected expressions")
+        ));
+    }
+
+    #[test]
+    fn insert_select_without_columns_is_invalid_query_shape() {
+        let source = Context::new().select(users::id).from(users::table);
+        let result = Context::new()
+            .insert_into(users::table)
+            .from_select(source)
+            .render();
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidQueryShape(message))
+                if message.contains("requires .columns")
+        ));
+    }
+
+    #[test]
+    fn insert_select_combined_with_values_is_invalid_query_shape() {
+        let source = Context::new().select(users::id).from(users::table);
+        let result = Context::new()
+            .insert_into(users::table)
+            .values(users::email.set(bind("a@b.c")))
+            .columns((users::id,))
+            .from_select(source)
+            .render();
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidQueryShape(message))
+                if message.contains("cannot combine")
+        ));
+    }
+
+    #[test]
+    fn renders_update_with_from_source() {
+        let query = Context::new()
+            .update(users::table)
+            .set(users::email.set(bind("touched@example.com")))
+            .from(posts::table)
+            .where_(posts::user_id.eq(users::id))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"update "public"."users" set "email" = $1 "#,
+                r#"from "blog"."posts" where ("posts"."user_id" = "users"."id")"#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn renders_update_from_returning_with_qualified_fields() {
+        let query = Context::new()
+            .update(users::table)
+            .set(users::email.set(bind("touched@example.com")))
+            .from(posts::table)
+            .where_(posts::user_id.eq(users::id))
+            .returning(users::id)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"update "public"."users" set "email" = $1 "#,
+                r#"from "blog"."posts" where ("posts"."user_id" = "users"."id") "#,
+                r#"returning "users"."id""#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn renders_delete_with_using_source() {
+        let query = Context::new()
+            .delete_from(users::table)
+            .using(posts::table)
+            .where_(posts::user_id.eq(users::id).and(posts::id.gt(bind(10_i64))))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"delete from "public"."users" using "blog"."posts" "#,
+                r#"where (("posts"."user_id" = "users"."id") and ("posts"."id" > $1))"#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn renders_delete_using_returning_with_qualified_fields() {
+        let query = Context::new()
+            .delete_from(users::table)
+            .using(posts::table)
+            .where_(posts::user_id.eq(users::id).and(posts::id.gt(bind(10_i64))))
+            .returning(users::id)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"delete from "public"."users" using "blog"."posts" "#,
+                r#"where (("posts"."user_id" = "users"."id") and ("posts"."id" > $1)) "#,
+                r#"returning "users"."id""#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn renders_condition_all_any_true_false() {
+        let empty_all: Vec<Condition> = Vec::new();
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(Condition::all(empty_all))
+            .render()
+            .unwrap();
+        assert_eq!(
+            query.sql(),
+            r#"select "users"."id" from "public"."users" where true"#
+        );
+
+        let empty_any: Vec<Condition> = Vec::new();
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(Condition::any(empty_any))
+            .render()
+            .unwrap();
+        assert_eq!(
+            query.sql(),
+            r#"select "users"."id" from "public"."users" where false"#
+        );
+
+        let filters = vec![
+            users::active.eq(bind(true)),
+            users::signup_rank.gt(bind(10_i32)),
+        ];
+        let query = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(Condition::all(filters))
+            .render()
+            .unwrap();
+        assert!(query
+            .sql()
+            .contains(r#"(("users"."active" = $1) and ("users"."signup_rank" > $2))"#));
+    }
+
+    #[test]
+    fn renders_abs_round_ceil_floor() {
+        fn assert_expr_type<T, N>(_: Expr<T, N>) {}
+
+        assert_expr_type::<i32, NotNull>(abs(users::signup_rank));
+        assert_expr_type::<rust_decimal::Decimal, NotNull>(round(users::signup_rank));
+        assert_expr_type::<f64, NotNull>(round(users::ratio));
+        assert_expr_type::<f64, NotNull>(ceil(users::ratio));
+        assert_expr_type::<f64, NotNull>(floor(users::ratio));
+
+        let query = Context::new()
+            .select((
+                abs(users::signup_rank).as_("a"),
+                round(users::ratio).as_("r"),
+                ceil(users::ratio).as_("c"),
+                floor(users::ratio).as_("f"),
+            ))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select abs("users"."signup_rank") as "a", "#,
+                r#"round("users"."ratio") as "r", "#,
+                r#"ceil("users"."ratio") as "c", "#,
+                r#"floor("users"."ratio") as "f" from "public"."users""#
+            )
+        );
+    }
+
+    #[test]
+    fn filter_alias_matches_where_for_select_update_delete() {
+        let s_filtered = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .filter(users::active.eq(bind(true)))
+            .render()
+            .unwrap();
+        let s_where = Context::new()
+            .select(users::id)
+            .from(users::table)
+            .where_(users::active.eq(bind(true)))
+            .render()
+            .unwrap();
+        assert_eq!(s_filtered.sql(), s_where.sql());
+
+        let u_filtered = Context::new()
+            .update(users::table)
+            .set(users::email.set(bind("a")))
+            .filter(users::id.eq(bind(1_i64)))
+            .render()
+            .unwrap();
+        let u_where = Context::new()
+            .update(users::table)
+            .set(users::email.set(bind("a")))
+            .where_(users::id.eq(bind(1_i64)))
+            .render()
+            .unwrap();
+        assert_eq!(u_filtered.sql(), u_where.sql());
+
+        let d_filtered = Context::new()
+            .delete_from(users::table)
+            .filter(users::id.eq(bind(1_i64)))
+            .render()
+            .unwrap();
+        let d_where = Context::new()
+            .delete_from(users::table)
+            .where_(users::id.eq(bind(1_i64)))
+            .render()
+            .unwrap();
+        assert_eq!(d_filtered.sql(), d_where.sql());
+    }
+
+    #[test]
+    fn vec_of_assignments_drives_dynamic_update() {
+        let mut patch: Vec<Assignment> = Vec::new();
+        let new_email: Option<String> = Some("new@example.com".to_owned());
+        let new_active: Option<bool> = None;
+        if let Some(v) = new_email {
+            patch.push(users::email.set(bind(v)));
+        }
+        if let Some(v) = new_active {
+            patch.push(users::active.set(bind(v)));
+        }
+
+        let query = Context::new()
+            .update(users::table)
+            .set(patch)
+            .where_(users::id.eq(bind(1_i64)))
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"update "public"."users" set "email" = $1 "#,
+                r#"where ("users"."id" = $2)"#
+            )
+        );
+    }
+
+    #[test]
+    fn renders_field_alias_in_select_list() {
+        let query = Context::new()
+            .select((users::id.as_("uid"), users::email))
+            .from(users::table)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select "users"."id" as "uid", "users"."email" "#,
+                r#"from "public"."users""#
+            )
         );
     }
 

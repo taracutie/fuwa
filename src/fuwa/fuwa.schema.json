@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "schema": {
+    "tables": [
+      {
+        "schema": "public",
+        "name": "users",
+        "columns": [
+          {
+            "name": "id",
+            "ordinal_position": 1,
+            "pg_type": "int8",
+            "pg_type_kind": "b",
+            "rust_type": { "path": "i64", "enum_type": false },
+            "nullable": false,
+            "default_expression": null,
+            "primary_key": true,
+            "unique": false,
+            "relation": null
+          },
+          {
+            "name": "email",
+            "ordinal_position": 2,
+            "pg_type": "text",
+            "pg_type_kind": "b",
+            "rust_type": { "path": "String", "enum_type": false },
+            "nullable": false,
+            "default_expression": null,
+            "primary_key": false,
+            "unique": true,
+            "relation": null
+          },
+          {
+            "name": "active",
+            "ordinal_position": 3,
+            "pg_type": "bool",
+            "pg_type_kind": "b",
+            "rust_type": { "path": "bool", "enum_type": false },
+            "nullable": false,
+            "default_expression": null,
+            "primary_key": false,
+            "unique": false,
+            "relation": null
+          }
+        ],
+        "primary_key": ["id"],
+        "uniques": [["email"]]
+      }
+    ],
+    "enums": []
+  }
+}

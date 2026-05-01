@@ -33,6 +33,49 @@ pub enum Error {
     /// Filesystem I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Postgres unique-constraint violation (SQLSTATE 23505).
+    #[error("unique violation: {message}")]
+    UniqueViolation {
+        constraint: Option<String>,
+        message: String,
+    },
+
+    /// Postgres foreign-key violation (SQLSTATE 23503).
+    #[error("foreign key violation: {message}")]
+    ForeignKeyViolation {
+        constraint: Option<String>,
+        message: String,
+    },
+
+    /// Postgres check-constraint violation (SQLSTATE 23514).
+    #[error("check violation: {message}")]
+    CheckViolation {
+        constraint: Option<String>,
+        message: String,
+    },
+
+    /// Postgres not-null violation (SQLSTATE 23502).
+    #[error("not null violation: {message}")]
+    NotNullViolation {
+        column: Option<String>,
+        message: String,
+    },
+
+    /// Serialization failure (SQLSTATE 40001) ~ retry the transaction.
+    #[error("serialization failure: {0}")]
+    SerializationFailure(String),
+
+    /// Deadlock detected (SQLSTATE 40P01) ~ retry the transaction.
+    #[error("deadlock detected: {0}")]
+    DeadlockDetected(String),
+
+    /// Generic PostgreSQL error with SQLSTATE for callers to match on.
+    #[error("postgres error ({sqlstate:?}): {message}")]
+    Postgres {
+        sqlstate: Option<String>,
+        message: String,
+    },
 }
 
 impl Error {
@@ -58,5 +101,12 @@ impl Error {
 
     pub fn unsupported_postgres_type(message: impl Into<String>) -> Self {
         Self::UnsupportedPostgresType(message.into())
+    }
+
+    pub fn postgres(sqlstate: Option<String>, message: impl Into<String>) -> Self {
+        Self::Postgres {
+            sqlstate,
+            message: message.into(),
+        }
     }
 }

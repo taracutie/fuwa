@@ -5,7 +5,8 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::{
-    BindParam, Field, NotNull, NotSingleColumn, NullabilityOutput, Nullable, SelectQuery, Table,
+    BindParam, ExprList, Field, NotNull, NotSingleColumn, NullabilityOutput, Nullable, OrderByList,
+    SelectQuery, Table,
 };
 
 /// Reference to a field in the AST.
@@ -110,6 +111,7 @@ impl_sql_array_element!(
     i16,
     i32,
     i64,
+    u32,
     f32,
     f64,
     bool,
@@ -143,6 +145,7 @@ impl_array_agg_input!(
     i16,
     i32,
     i64,
+    u32,
     f32,
     f64,
     bool,
@@ -275,7 +278,7 @@ impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
 impl_coalesce_nullability_list!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
 /// Runtime SQL expression AST.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExprNode {
     Field(FieldRef),
     ExcludedField(FieldRef),
@@ -326,16 +329,37 @@ pub enum ExprNode {
         branches: Vec<(ExprNode, ExprNode)>,
         else_expr: Option<Box<ExprNode>>,
     },
+    Window {
+        func: Box<ExprNode>,
+        spec: Box<WindowSpec>,
+    },
+    Exists {
+        query: Box<SelectQuery<(), NotSingleColumn>>,
+        negated: bool,
+    },
+    Cast {
+        expr: Box<ExprNode>,
+        sql_type: &'static str,
+    },
+    DateTrunc {
+        field: &'static str,
+        expr: Box<ExprNode>,
+    },
+    Extract {
+        field: &'static str,
+        expr: Box<ExprNode>,
+    },
+    Bool(bool),
     Star,
 }
 
 /// Runtime operand for an `IN` or `NOT IN` predicate.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InOperandNode {
     pub(crate) kind: InOperandKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum InOperandKind {
     List(Vec<ExprNode>),
     Subquery(Box<SelectQuery<(), NotSingleColumn>>),
@@ -356,7 +380,7 @@ impl InOperandNode {
 }
 
 /// A typed SQL expression.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Expr<T, N = NotNull> {
     pub(crate) node: ExprNode,
     marker: PhantomData<fn() -> (T, N)>,
@@ -857,6 +881,99 @@ impl<T, N> Field<T, N> {
     }
 }
 
+impl<T, N> Field<T, N>
+where
+    T: SqlJsonb,
+{
+    pub fn json_get<K>(self, key: K) -> Expr<serde_json::Value, Nullable>
+    where
+        K: IntoExpr<String>,
+    {
+        self.expr().json_get(key)
+    }
+
+    pub fn json_get_text<K>(self, key: K) -> Expr<String, Nullable>
+    where
+        K: IntoExpr<String>,
+    {
+        self.expr().json_get_text(key)
+    }
+
+    pub fn json_path<P>(self, path: P) -> Expr<serde_json::Value, Nullable>
+    where
+        P: IntoExpr<Vec<String>>,
+    {
+        self.expr().json_path(path)
+    }
+
+    pub fn json_path_text<P>(self, path: P) -> Expr<String, Nullable>
+    where
+        P: IntoExpr<Vec<String>>,
+    {
+        self.expr().json_path_text(path)
+    }
+
+    pub fn contains<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<T>,
+    {
+        self.expr().contains(rhs)
+    }
+
+    pub fn has_key<K>(self, key: K) -> Condition
+    where
+        K: IntoExpr<String>,
+    {
+        self.expr().has_key(key)
+    }
+}
+
+impl<T, N> Field<Vec<T>, N>
+where
+    T: SqlArrayElement,
+{
+    pub fn contains<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<Vec<T>>,
+    {
+        self.expr().contains(rhs)
+    }
+
+    pub fn overlaps<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<Vec<T>>,
+    {
+        self.expr().overlaps(rhs)
+    }
+
+    pub fn concat<R>(self, rhs: R) -> Expr<Vec<T>, <N as NullableIfEither<R::Nullability>>::Output>
+    where
+        R: IntoExpr<Vec<T>>,
+        N: NullableIfEither<R::Nullability>,
+    {
+        self.expr().concat(rhs)
+    }
+}
+
+impl<T, N> Field<T, N>
+where
+    T: SqlArrayElement,
+{
+    pub fn eq_any<A>(self, array: A) -> Condition
+    where
+        A: IntoExpr<Vec<T>>,
+    {
+        self.expr().eq_any(array)
+    }
+
+    pub fn eq_all<A>(self, array: A) -> Condition
+    where
+        A: IntoExpr<Vec<T>>,
+    {
+        self.expr().eq_all(array)
+    }
+}
+
 impl<N> Field<String, N> {
     pub fn like<R>(self, rhs: R) -> Condition
     where
@@ -974,7 +1091,7 @@ impl<T, R> InOperand<T> for SelectQuery<R, T> {
 }
 
 /// A boolean SQL condition.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Condition {
     pub(crate) node: ExprNode,
 }
@@ -1003,6 +1120,44 @@ impl Condition {
             },
         }
     }
+
+    /// Combine an iterator of conditions with `AND`. Returns `TRUE` when empty.
+    pub fn all<I>(conditions: I) -> Condition
+    where
+        I: IntoIterator<Item = Condition>,
+    {
+        let mut iter = conditions.into_iter();
+        match iter.next() {
+            None => Self::true_(),
+            Some(first) => iter.fold(first, |acc, next| acc.and(next)),
+        }
+    }
+
+    /// Combine an iterator of conditions with `OR`. Returns `FALSE` when empty.
+    pub fn any<I>(conditions: I) -> Condition
+    where
+        I: IntoIterator<Item = Condition>,
+    {
+        let mut iter = conditions.into_iter();
+        match iter.next() {
+            None => Self::false_(),
+            Some(first) => iter.fold(first, |acc, next| acc.or(next)),
+        }
+    }
+
+    /// Construct the SQL constant `TRUE`.
+    pub fn true_() -> Condition {
+        Condition {
+            node: ExprNode::Bool(true),
+        }
+    }
+
+    /// Construct the SQL constant `FALSE`.
+    pub fn false_() -> Condition {
+        Condition {
+            node: ExprNode::Bool(false),
+        }
+    }
 }
 
 impl Not for Condition {
@@ -1022,6 +1177,52 @@ pub fn not(condition: Condition) -> Condition {
         },
     }
 }
+
+/// Anything that can be converted into a [`Condition`].
+///
+/// Tuples up to 16 elements are supported; each element must implement
+/// `IntoCondition`. Tuple inputs are AND-folded so `where_((a, b, c))`
+/// is equivalent to `where_(a.and(b).and(c))`.
+pub trait IntoCondition {
+    fn into_condition(self) -> Condition;
+}
+
+impl IntoCondition for Condition {
+    fn into_condition(self) -> Condition {
+        self
+    }
+}
+
+macro_rules! impl_tuple_into_condition {
+    ($($ty:ident $var:ident),+ $(,)?) => {
+        impl<$($ty),+> IntoCondition for ($($ty,)+)
+        where
+            $($ty: IntoCondition),+
+        {
+            fn into_condition(self) -> Condition {
+                let ($($var,)+) = self;
+                Condition::all([$($var.into_condition()),+])
+            }
+        }
+    };
+}
+
+impl_tuple_into_condition!(A a);
+impl_tuple_into_condition!(A a, B b);
+impl_tuple_into_condition!(A a, B b, C c);
+impl_tuple_into_condition!(A a, B b, C c, D d);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g, H h);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g, H h, I i);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o);
+impl_tuple_into_condition!(A a, B b, C c, D d, E e, F f, G g, H h, I i, J j, K k, L l, M m, N n, O o, P p);
 
 /// Convert an expression to nullable at the type level without changing SQL text.
 pub fn nullable<T, E>(expr: E) -> Expr<T, Nullable>
@@ -1117,7 +1318,7 @@ where
 pub struct CaseWhenStart;
 
 /// Builder for a typed SQL `case when ... then ... end` expression.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CaseWhen<T, N> {
     branches: Vec<(ExprNode, ExprNode)>,
     marker: PhantomData<fn() -> (T, N)>,
@@ -1185,7 +1386,7 @@ pub enum OrderDirection {
 }
 
 /// SQL `ORDER BY` expression.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OrderExpr {
     pub(crate) expr: ExprNode,
     pub(crate) direction: OrderDirection,
@@ -1267,6 +1468,57 @@ impl AvgOutput for f32 {
 impl AvgOutput for f64 {
     type Output = f64;
 }
+
+/// PostgreSQL return type for `round`, `ceil`, and `floor`.
+pub trait RoundingOutput {
+    type Output;
+}
+
+impl RoundingOutput for i16 {
+    type Output = Decimal;
+}
+
+impl RoundingOutput for i32 {
+    type Output = Decimal;
+}
+
+impl RoundingOutput for i64 {
+    type Output = Decimal;
+}
+
+impl RoundingOutput for Decimal {
+    type Output = Decimal;
+}
+
+impl RoundingOutput for f32 {
+    type Output = f64;
+}
+
+impl RoundingOutput for f64 {
+    type Output = f64;
+}
+
+/// PostgreSQL return type for `date_trunc`.
+#[doc(hidden)]
+pub trait DateTruncOutput {
+    type Output;
+}
+
+impl DateTruncOutput for chrono::NaiveDateTime {
+    type Output = chrono::NaiveDateTime;
+}
+
+impl DateTruncOutput for chrono::DateTime<chrono::Utc> {
+    type Output = chrono::DateTime<chrono::Utc>;
+}
+
+/// PostgreSQL types accepted by `extract(field from expression)`.
+#[doc(hidden)]
+pub trait SqlTemporal {}
+
+impl SqlTemporal for chrono::NaiveDate {}
+impl SqlTemporal for chrono::NaiveDateTime {}
+impl SqlTemporal for chrono::DateTime<chrono::Utc> {}
 
 /// Render `sum(expression)`.
 pub fn sum<T, E>(expr: E) -> Expr<T::Output, Nullable>
@@ -1387,4 +1639,513 @@ where
         name: "jsonb_array_length",
         args: vec![expr.into_expr().into_node()],
     })
+}
+
+/// Render PostgreSQL `greatest(...)`. Nullable only when every argument is nullable.
+pub fn greatest<T, A>(args: A) -> Expr<T, A::Nullability>
+where
+    A: CoalesceArgs<T>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "greatest",
+        args: args.into_nodes(),
+    })
+}
+
+/// Render PostgreSQL `least(...)`. Nullable only when every argument is nullable.
+pub fn least<T, A>(args: A) -> Expr<T, A::Nullability>
+where
+    A: CoalesceArgs<T>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "least",
+        args: args.into_nodes(),
+    })
+}
+
+/// Render PostgreSQL `length(text_expr)`.
+pub fn length<E>(expr: E) -> Expr<i32, E::Nullability>
+where
+    E: IntoExpr<String>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "length",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render PostgreSQL `lower(text_expr)`.
+pub fn lower<E>(expr: E) -> Expr<String, E::Nullability>
+where
+    E: IntoExpr<String>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "lower",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render PostgreSQL `upper(text_expr)`.
+pub fn upper<E>(expr: E) -> Expr<String, E::Nullability>
+where
+    E: IntoExpr<String>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "upper",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render PostgreSQL `trim(text_expr)`.
+pub fn trim<E>(expr: E) -> Expr<String, E::Nullability>
+where
+    E: IntoExpr<String>,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "trim",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render PostgreSQL `abs(numeric_expr)`.
+pub fn abs<T, E>(expr: E) -> Expr<T, E::Nullability>
+where
+    E: IntoExpr<T>,
+    T: SqlNumeric,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "abs",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render PostgreSQL `round(numeric_expr)`.
+pub fn round<T, E>(expr: E) -> Expr<T::Output, E::Nullability>
+where
+    E: IntoExpr<T>,
+    T: RoundingOutput,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "round",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render PostgreSQL `ceil(numeric_expr)`.
+pub fn ceil<T, E>(expr: E) -> Expr<T::Output, E::Nullability>
+where
+    E: IntoExpr<T>,
+    T: RoundingOutput,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "ceil",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render PostgreSQL `floor(numeric_expr)`.
+pub fn floor<T, E>(expr: E) -> Expr<T::Output, E::Nullability>
+where
+    E: IntoExpr<T>,
+    T: RoundingOutput,
+{
+    Expr::from_node(ExprNode::Function {
+        name: "floor",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render PostgreSQL `now()`.
+pub fn now() -> Expr<chrono::DateTime<chrono::Utc>, NotNull> {
+    Expr::from_node(ExprNode::Function {
+        name: "now",
+        args: Vec::new(),
+    })
+}
+
+/// Render PostgreSQL `date_trunc(field, timestamp_expr)`.
+///
+/// ```compile_fail
+/// use fuwa_core::{date_trunc, Field, NotNull, Table};
+///
+/// let table = Table::new("public", "events");
+/// let day: Field<chrono::NaiveDate, NotNull> = table.field("day");
+/// let _ = date_trunc("day", day);
+/// ```
+pub fn date_trunc<E, T>(field: &'static str, expr: E) -> Expr<T::Output, E::Nullability>
+where
+    E: IntoExpr<T>,
+    T: DateTruncOutput,
+{
+    Expr::from_node(ExprNode::DateTrunc {
+        field,
+        expr: Box::new(expr.into_expr().into_node()),
+    })
+}
+
+/// Render PostgreSQL `extract(field from timestamp_expr)`.
+///
+/// ```compile_fail
+/// use fuwa_core::{extract, Field, NotNull, Table};
+///
+/// let table = Table::new("public", "users");
+/// let id: Field<i64, NotNull> = table.field("id");
+/// let _ = extract("year", id);
+/// ```
+pub fn extract<E, T>(field: &'static str, expr: E) -> Expr<rust_decimal::Decimal, E::Nullability>
+where
+    E: IntoExpr<T>,
+    T: SqlTemporal,
+{
+    Expr::from_node(ExprNode::Extract {
+        field,
+        expr: Box::new(expr.into_expr().into_node()),
+    })
+}
+
+/// Render a typed PostgreSQL `CAST(expr AS type)`.
+pub fn cast<T, S, E>(expr: E) -> Expr<S, E::Nullability>
+where
+    E: IntoExpr<T>,
+    S: SqlType,
+{
+    Expr::from_node(ExprNode::Cast {
+        expr: Box::new(expr.into_expr().into_node()),
+        sql_type: S::SQL_TYPE,
+    })
+}
+
+/// Maps Rust scalar types to a PostgreSQL type name suitable for `CAST(... AS ...)`.
+pub trait SqlType {
+    const SQL_TYPE: &'static str;
+}
+
+impl SqlType for i16 {
+    const SQL_TYPE: &'static str = "int2";
+}
+impl SqlType for i32 {
+    const SQL_TYPE: &'static str = "int4";
+}
+impl SqlType for i64 {
+    const SQL_TYPE: &'static str = "int8";
+}
+impl SqlType for f32 {
+    const SQL_TYPE: &'static str = "float4";
+}
+impl SqlType for f64 {
+    const SQL_TYPE: &'static str = "float8";
+}
+impl SqlType for rust_decimal::Decimal {
+    const SQL_TYPE: &'static str = "numeric";
+}
+impl SqlType for bool {
+    const SQL_TYPE: &'static str = "bool";
+}
+impl SqlType for String {
+    const SQL_TYPE: &'static str = "text";
+}
+impl SqlType for serde_json::Value {
+    const SQL_TYPE: &'static str = "jsonb";
+}
+impl SqlType for Uuid {
+    const SQL_TYPE: &'static str = "uuid";
+}
+impl SqlType for chrono::NaiveDate {
+    const SQL_TYPE: &'static str = "date";
+}
+impl SqlType for chrono::NaiveDateTime {
+    const SQL_TYPE: &'static str = "timestamp";
+}
+impl SqlType for chrono::DateTime<chrono::Utc> {
+    const SQL_TYPE: &'static str = "timestamptz";
+}
+impl SqlType for Vec<u8> {
+    const SQL_TYPE: &'static str = "bytea";
+}
+
+/// Render PostgreSQL `EXISTS (subquery)`.
+pub fn exists<R, S, Q>(query: Q) -> Condition
+where
+    Q: IntoExistsQuery<R, S>,
+{
+    Condition {
+        node: ExprNode::Exists {
+            query: Box::new(query.into_select_query()),
+            negated: false,
+        },
+    }
+}
+
+/// Render PostgreSQL `NOT EXISTS (subquery)`.
+pub fn not_exists<R, S, Q>(query: Q) -> Condition
+where
+    Q: IntoExistsQuery<R, S>,
+{
+    Condition {
+        node: ExprNode::Exists {
+            query: Box::new(query.into_select_query()),
+            negated: true,
+        },
+    }
+}
+
+/// Convertible into a `SELECT` query erased of its record type for use with `EXISTS`.
+pub trait IntoExistsQuery<R, S> {
+    #[doc(hidden)]
+    fn into_select_query(self) -> SelectQuery<(), NotSingleColumn>;
+}
+
+impl<R, S> IntoExistsQuery<R, S> for SelectQuery<R, S> {
+    fn into_select_query(self) -> SelectQuery<(), NotSingleColumn> {
+        self.erase_record()
+    }
+}
+
+/// SQL window function frame unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameUnit {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// SQL window function frame bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(i64),
+    CurrentRow,
+    Following(i64),
+    UnboundedFollowing,
+}
+
+/// SQL window function frame.
+#[derive(Debug, Clone)]
+pub struct WindowFrame {
+    pub(crate) unit: WindowFrameUnit,
+    pub(crate) start: WindowFrameBound,
+    pub(crate) end: WindowFrameBound,
+}
+
+/// SQL `OVER (...)` window specification.
+#[derive(Debug, Clone, Default)]
+pub struct WindowSpec {
+    pub(crate) partition_by: Vec<ExprNode>,
+    pub(crate) order_by: Vec<OrderExpr>,
+    pub(crate) frame: Option<WindowFrame>,
+}
+
+impl WindowSpec {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn partition_by<E>(mut self, cols: E) -> Self
+    where
+        E: ExprList,
+    {
+        self.partition_by.extend(cols.into_exprs());
+        self
+    }
+
+    pub fn order_by<O>(mut self, order: O) -> Self
+    where
+        O: OrderByList,
+    {
+        self.order_by.extend(order.into_order_by());
+        self
+    }
+
+    pub fn rows_between(mut self, start: WindowFrameBound, end: WindowFrameBound) -> Self {
+        self.frame = Some(WindowFrame {
+            unit: WindowFrameUnit::Rows,
+            start,
+            end,
+        });
+        self
+    }
+
+    pub fn range_between(mut self, start: WindowFrameBound, end: WindowFrameBound) -> Self {
+        self.frame = Some(WindowFrame {
+            unit: WindowFrameUnit::Range,
+            start,
+            end,
+        });
+        self
+    }
+
+    pub fn groups_between(mut self, start: WindowFrameBound, end: WindowFrameBound) -> Self {
+        self.frame = Some(WindowFrame {
+            unit: WindowFrameUnit::Groups,
+            start,
+            end,
+        });
+        self
+    }
+}
+
+/// Begin a window specification with `PARTITION BY ...`.
+pub fn partition_by<E>(cols: E) -> WindowSpec
+where
+    E: ExprList,
+{
+    WindowSpec::new().partition_by(cols)
+}
+
+/// Window frame bound `UNBOUNDED PRECEDING`.
+pub fn unbounded_preceding() -> WindowFrameBound {
+    WindowFrameBound::UnboundedPreceding
+}
+
+/// Window frame bound `UNBOUNDED FOLLOWING`.
+pub fn unbounded_following() -> WindowFrameBound {
+    WindowFrameBound::UnboundedFollowing
+}
+
+/// Window frame bound `CURRENT ROW`.
+pub fn current_row() -> WindowFrameBound {
+    WindowFrameBound::CurrentRow
+}
+
+/// Window frame bound `N PRECEDING`.
+pub fn preceding(n: i64) -> WindowFrameBound {
+    WindowFrameBound::Preceding(n)
+}
+
+/// Window frame bound `N FOLLOWING`.
+pub fn following(n: i64) -> WindowFrameBound {
+    WindowFrameBound::Following(n)
+}
+
+/// A pure SQL window function that requires an `OVER (...)` clause to be selectable.
+#[derive(Debug, Clone)]
+pub struct WindowFunction<T, N = NotNull> {
+    node: ExprNode,
+    marker: PhantomData<fn() -> (T, N)>,
+}
+
+impl<T, N> WindowFunction<T, N> {
+    fn from_node(node: ExprNode) -> Self {
+        Self {
+            node,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn over(self, spec: WindowSpec) -> Expr<T, N> {
+        Expr::from_node(ExprNode::Window {
+            func: Box::new(self.node),
+            spec: Box::new(spec),
+        })
+    }
+}
+
+/// Render `row_number() OVER (...)`.
+pub fn row_number() -> WindowFunction<i64, NotNull> {
+    WindowFunction::from_node(ExprNode::Function {
+        name: "row_number",
+        args: Vec::new(),
+    })
+}
+
+/// Render `rank() OVER (...)`.
+pub fn rank() -> WindowFunction<i64, NotNull> {
+    WindowFunction::from_node(ExprNode::Function {
+        name: "rank",
+        args: Vec::new(),
+    })
+}
+
+/// Render `dense_rank() OVER (...)`.
+pub fn dense_rank() -> WindowFunction<i64, NotNull> {
+    WindowFunction::from_node(ExprNode::Function {
+        name: "dense_rank",
+        args: Vec::new(),
+    })
+}
+
+/// Render `lag(expr) OVER (...)`. Always nullable since edge rows have no predecessor.
+pub fn lag<T, E>(expr: E) -> WindowFunction<T, Nullable>
+where
+    E: IntoExpr<T>,
+{
+    WindowFunction::from_node(ExprNode::Function {
+        name: "lag",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `lead(expr) OVER (...)`. Always nullable since edge rows have no successor.
+pub fn lead<T, E>(expr: E) -> WindowFunction<T, Nullable>
+where
+    E: IntoExpr<T>,
+{
+    WindowFunction::from_node(ExprNode::Function {
+        name: "lead",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `first_value(expr) OVER (...)`.
+pub fn first_value<T, E>(expr: E) -> WindowFunction<T, Nullable>
+where
+    E: IntoExpr<T>,
+{
+    WindowFunction::from_node(ExprNode::Function {
+        name: "first_value",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `last_value(expr) OVER (...)`.
+pub fn last_value<T, E>(expr: E) -> WindowFunction<T, Nullable>
+where
+    E: IntoExpr<T>,
+{
+    WindowFunction::from_node(ExprNode::Function {
+        name: "last_value",
+        args: vec![expr.into_expr().into_node()],
+    })
+}
+
+/// Render `ntile(buckets) OVER (...)`.
+pub fn ntile(buckets: i32) -> WindowFunction<i32, NotNull> {
+    WindowFunction::from_node(ExprNode::Function {
+        name: "ntile",
+        args: vec![ExprNode::Bind(BindParam::new(std::sync::Arc::new(buckets)))],
+    })
+}
+
+impl<T, N> Expr<T, N> {
+    /// Wrap this expression in `OVER (...)` to produce a window expression.
+    pub fn over(self, spec: WindowSpec) -> Expr<T, N> {
+        Expr::from_node(ExprNode::Window {
+            func: Box::new(self.into_node()),
+            spec: Box::new(spec),
+        })
+    }
+
+    /// Attach a SQL column alias for use in `SELECT` and `RETURNING` lists.
+    pub fn as_(self, alias: &'static str) -> AliasedExpr<T, N> {
+        AliasedExpr {
+            expr: self.into_node(),
+            alias,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T, N> Field<T, N> {
+    /// Attach a SQL column alias for use in `SELECT` and `RETURNING` lists.
+    pub fn as_(self, alias: &'static str) -> AliasedExpr<T, N> {
+        self.expr().as_(alias)
+    }
+}
+
+/// A SQL expression with an explicit column alias.
+#[derive(Debug, Clone)]
+pub struct AliasedExpr<T, N = NotNull> {
+    pub(crate) expr: ExprNode,
+    pub(crate) alias: &'static str,
+    marker: PhantomData<fn() -> (T, N)>,
 }

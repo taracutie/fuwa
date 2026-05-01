@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::{BindValue, IntoBindValue, RenderQuery, RenderedQuery, Result};
 
@@ -12,6 +13,16 @@ pub struct RawQuery<R = ()> {
     sql: String,
     binds: Vec<BindValue>,
     marker: PhantomData<fn() -> R>,
+}
+
+impl<R> Clone for RawQuery<R> {
+    fn clone(&self) -> Self {
+        Self {
+            sql: self.sql.clone(),
+            binds: self.binds.clone(),
+            marker: PhantomData,
+        }
+    }
 }
 
 /// Create a raw SQL query with separately collected bind values.
@@ -30,8 +41,13 @@ impl<R> RawQuery<R> {
     where
         T: IntoBindValue,
     {
-        self.binds.push(Box::new(value.into_stored()));
+        self.binds.push(Arc::new(value.into_stored()));
         self
+    }
+
+    /// Render this query without consuming it.
+    pub fn render_ref(&self) -> Result<RenderedQuery> {
+        Ok(RenderedQuery::new(self.sql.clone(), self.binds.clone()))
     }
 
     /// Override the associated record marker for documentation and type inference.
@@ -52,4 +68,8 @@ impl<R> RenderQuery for RawQuery<R> {
     fn render(self) -> Result<RenderedQuery> {
         Ok(RenderedQuery::new(self.sql, self.binds))
     }
+}
+
+impl<R> crate::Query for RawQuery<R> {
+    type Row = R;
 }

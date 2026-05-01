@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::{Expr, Field, NotNull, Nullable};
+use crate::{AliasedExpr, Expr, Field, NotNull, Nullable};
 
 /// Maps SQL nullability markers to Rust selected value types.
 pub trait NullabilityOutput<T> {
@@ -15,15 +15,16 @@ impl<T> NullabilityOutput<T> for Nullable {
     type Output = Option<T>;
 }
 
-/// A selected expression in a query.
-#[derive(Debug)]
+/// A selected expression in a query, optionally with a SQL column alias.
+#[derive(Debug, Clone)]
 pub struct SelectItem {
     pub(crate) expr: crate::ExprNode,
+    pub(crate) alias: Option<&'static str>,
 }
 
 /// Marker used for selections that are not a single SQL expression.
 #[doc(hidden)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum NotSingleColumn {}
 
 /// Something that can appear in a `select(...)` or `returning(...)` list.
@@ -45,6 +46,7 @@ where
     fn into_select_items(self) -> Vec<SelectItem> {
         vec![SelectItem {
             expr: self.expr().into_node(),
+            alias: None,
         }]
     }
 }
@@ -59,12 +61,28 @@ where
     fn into_select_items(self) -> Vec<SelectItem> {
         vec![SelectItem {
             expr: self.into_node(),
+            alias: None,
+        }]
+    }
+}
+
+impl<T, N> Selectable for AliasedExpr<T, N>
+where
+    N: NullabilityOutput<T>,
+{
+    type Record = <N as NullabilityOutput<T>>::Output;
+    type SingleSql = T;
+
+    fn into_select_items(self) -> Vec<SelectItem> {
+        vec![SelectItem {
+            expr: self.expr,
+            alias: Some(self.alias),
         }]
     }
 }
 
 /// Override the Rust record type associated with an existing selection.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SelectionAs<R, S> {
     selection: S,
     marker: PhantomData<fn() -> R>,

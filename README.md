@@ -26,6 +26,34 @@ use fuwa::prelude::*;
 let dsl = Dsl::connect(database_url)?;
 ```
 
+### two equivalent forms
+
+`fuwa` exposes both a JOOQ-style free-function form and a method-on-`dsl` form.
+they produce byte-identical SQL ~ pick whichever reads nicer for the call site.
+
+```rust
+// free-function form: query construction is decoupled from the executor.
+// great for helpers that build queries in one place and run them in another.
+let q = select((users::id, users::email))
+    .from(users::table)
+    .where_(users::active.eq(true));
+let rows = dsl.fetch_all(q).await?;
+
+// method-on-dsl form: ergonomic for one-shot reads.
+let rows = dsl
+    .select((users::id, users::email))
+    .from(users::table)
+    .where_(users::active.eq(true))
+    .fetch_all()
+    .await?;
+```
+
+`select`, `insert_into`, `update`, `delete_from`, and `with` are all available
+as free functions in `fuwa::prelude`. the runners on `DslContext` are
+`fetch_all`, `fetch_one`, `fetch_optional`, and `execute`; each has a
+`_as::<T>()` override when you want to decode rows into a hand-rolled type
+instead of the projection's inferred row type.
+
 ### simple select
 
 ```sql
@@ -59,12 +87,16 @@ order by accounts.id asc, posts.id asc
 dsl.select((accounts::email, posts::title, posts::score))
    .from(accounts::table)
    .join(posts::table.on(posts::account_id.eq(accounts::id)))
-   .where_(
-       accounts::active.eq(true)
-           .and(posts::published.eq(true)),
-   )
+   .where_((
+       accounts::active.eq(true),
+       posts::published.eq(true),
+   ))
    .order_by((accounts::id.asc(), posts::id.asc()))
 ```
+
+a tuple in `where_` / `having` / `on` AND-folds its elements, so the snippet
+above is equivalent to `.where_(a.and(b))`. `Condition::all([..])` and
+`Condition::any([..])` work the same way for `Vec`-shaped predicates.
 
 ### aggregation, group by, having
 
@@ -185,8 +217,9 @@ where id in (
 ```
 
 ```rust
-let published_authors = dsl
-    .select(posts::account_id)
+// the free-function form is handy for subqueries: no dsl handle needed
+// to build the inner SELECT, only to run the outer one.
+let published_authors = select(posts::account_id)
     .from(posts::table)
     .where_(posts::published.eq(true));
 
@@ -211,26 +244,163 @@ where profile @> '{"active": true}'::jsonb
 ```
 
 ```rust
-dsl.select((accounts::id, accounts::profile.expr().json_get_text("role")))
+dsl.select((accounts::id, accounts::profile.json_get_text("role")))
    .from(accounts::table)
    .where_(
        accounts::profile
-           .expr()
            .contains(serde_json::json!({ "active": true }))
-           .and(accounts::profile.expr().has_key("role"))
-           .and(accounts::tags.expr().overlaps(vec!["beta", "internal"]))
-           .and(
-               accounts::email
-                   .expr()
-                   .eq_any(vec!["tara@example.com", "ada@example.com"]),
-           ),
+           .and(accounts::profile.has_key("role"))
+           .and(accounts::tags.overlaps(vec!["beta", "internal"]))
+           .and(accounts::email.eq_any(vec!["tara@example.com", "ada@example.com"])),
    )
 ```
 
-jsonb operators are available on `Expr<serde_json::Value, _>`, and array
-operators are available on `Expr<Vec<T>, _>`, so generated field constants use
-`.expr()` before postgres-native helpers like `json_get_text`, `contains`,
-`overlaps`, `concat`, `eq_any`, and `eq_all`.
+jsonb operators (`json_get`, `json_get_text`, `json_path`, `json_path_text`,
+`contains`, `has_key`) work directly on jsonb fields and `Expr<serde_json::Value, _>`.
+array operators (`contains`, `overlaps`, `concat`, `eq_any`, `eq_all`) work
+directly on array fields and `Expr<Vec<T>, _>`. drop into `.expr()` only when
+you need to compose with custom expressions.
+
+### window functions
+
+```sql
+select
+    id,
+    row_number() over (partition by account_id order by created_at desc) as rn,
+    sum(amount) over (
+        partition by account_id
+        order by created_at asc
+        rows between unbounded preceding and current row
+    ) as running_total
+from transactions
+```
+
+```rust
+dsl.select((
+       transactions::id,
+       row_number()
+           .over(
+               partition_by(transactions::account_id)
+                   .order_by(transactions::created_at.desc()),
+           )
+           .as_("rn"),
+       sum(transactions::amount)
+           .over(
+               partition_by(transactions::account_id)
+                   .order_by(transactions::created_at.asc())
+                   .rows_between(unbounded_preceding(), current_row()),
+           )
+           .as_("running_total"),
+   ))
+   .from(transactions::table)
+```
+
+`row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`, `last_value`,
+and `ntile` are pure window functions (require `.over(...)`). every aggregate
+also has `.over(...)` for window-shaped sums / averages / etc. frames support
+`rows_between`, `range_between`, `groups_between`.
+
+### set operators (union, except, intersect)
+
+```sql
+(select id from accounts where active = true)
+union all
+(select id from accounts where signup_rank > 100)
+order by id asc
+limit 50
+```
+
+```rust
+let active = dsl.select(accounts::id)
+                .from(accounts::table)
+                .where_(accounts::active.eq(true));
+let high = dsl.select(accounts::id)
+              .from(accounts::table)
+              .where_(accounts::signup_rank.gt(100));
+
+active.union_all(high).order_by(accounts::id.asc()).limit(50)
+```
+
+`union`, `union_all`, `except`, `except_all`, `intersect`, `intersect_all` all
+work this way. column shape on both sides has to match at the type level.
+
+### more joins (right / full / cross / lateral)
+
+```rust
+// inner / left / right / full
+dsl.select(...).right_join(other::table.on(...))
+dsl.select(...).full_join(other::table.on(...))
+
+// cross join (no on clause)
+dsl.select(...).cross_join(other::table)
+
+// lateral correlations for "latest N per group"-style queries
+let latest_post = dsl
+    .select(posts::title)
+    .from(posts::table)
+    .where_(posts::account_id.eq(accounts::id))
+    .order_by(posts::created_at.desc())
+    .limit(1)
+    .alias("latest");
+dsl.select((accounts::id, latest_post.field_of(posts::title)))
+   .from(accounts::table)
+   .cross_join_lateral(latest_post)
+```
+
+`join_lateral` and `left_join_lateral` are also available for lateral joins
+that need an `on` condition.
+
+### row locking (for update / skip locked / nowait)
+
+```sql
+select id from jobs
+where status = 'queued'
+order by created_at asc
+limit 1
+for update skip locked
+```
+
+```rust
+dsl.select(jobs::id)
+   .from(jobs::table)
+   .where_(jobs::status.eq("queued"))
+   .order_by(jobs::created_at.asc())
+   .limit(1)
+   .for_update()
+   .skip_locked()
+```
+
+`for_update`, `for_no_key_update`, `for_share`, `for_key_share` cover all four
+strengths. `.of(table)` narrows the lock scope; `.skip_locked()` and
+`.no_wait()` choose the contention behaviour.
+
+### exists / cast / extract / date_trunc / now / greatest / least / length / lower / upper / trim / abs / round / ceil / floor
+
+every common postgres function is now a typed helper. nullability propagates
+correctly:
+
+```rust
+use fuwa::prelude::*;
+
+dsl.select((
+       accounts::id,
+       cast::<i32, String, _>(accounts::signup_rank).as_("rank_str"),
+       extract::<_, _>("year", accounts::created_at).as_("year"),
+       date_trunc("day", accounts::created_at).as_("day_bucket"),
+       greatest((accounts::signup_rank, bind(0_i32))).as_("at_least_zero"),
+       length(accounts::email).as_("email_len"),
+       lower(accounts::email).as_("email_lc"),
+   ))
+   .from(accounts::table)
+   .where_(exists(
+       dsl.select(posts::id)
+          .from(posts::table)
+          .where_(posts::account_id.eq(accounts::id)),
+   ))
+```
+
+every selectable expression also has `.as_("alias")` to attach a SQL column
+alias.
 
 ### case / coalesce / concat
 
@@ -268,6 +438,8 @@ values ('tara@example.com', true)
 returning id
 ```
 
+the column-by-column form spells every assignment out:
+
 ```rust
 dsl.insert_into(users::table)
    .values((
@@ -276,6 +448,107 @@ dsl.insert_into(users::table)
    ))
    .returning(users::id)
 ```
+
+for full-row inserts, codegen already emits `impl Assignments for users::Record`
+on every table, so `dsl.insert_into(table).value(record)` works:
+
+```rust
+dsl.insert_into(users::table)
+   .value(users::Record {
+       id: 1,
+       email: "tara@example.com".to_owned(),
+       active: true,
+       // ...
+   })
+   .returning(users::id)
+```
+
+for partial inserts (e.g. when the primary key is `bigserial` and you don't
+want to set `id`), define a narrower struct and `#[derive(Insertable)]` ~ the
+attribute points at the schema module that owns the field constants:
+
+```rust
+use fuwa::Insertable;
+
+#[derive(Insertable)]
+#[fuwa(table = users)]
+struct NewUser {
+    email: String,
+    active: bool,
+}
+
+dsl.insert_into(users::table)
+   .value(NewUser { email: "tara@example.com".into(), active: true })
+   .returning(users::id)
+```
+
+`#[derive(Patch)]` is the matching shape for partial UPDATEs ~ it wraps each
+field in `Option<T>` and only emits assignments for `Some(_)` values:
+
+```rust
+use fuwa::Patch;
+
+#[derive(Patch, Default)]
+#[fuwa(table = users)]
+struct UserPatch {
+    email: Option<String>,
+    active: Option<bool>,
+}
+
+dsl.update(users::table)
+   .set(UserPatch { email: Some("new@example.com".into()), ..Default::default() })
+   .where_(users::id.eq(7_i64))
+```
+
+### insert ... select / update ... from / delete ... using
+
+```sql
+insert into archive (id, payload)
+select id, payload from events where created_at < now() - interval '30 days';
+```
+
+```rust
+dsl.insert_into(archive::table)
+   .columns((archive::id, archive::payload))
+   .from_select(
+       dsl.select((events::id, events::payload))
+          .from(events::table)
+          .where_(events::created_at.lt(bind(cutoff))),
+   )
+```
+
+```rust
+// update t set x = other.y from other where other.id = t.id
+dsl.update(users::table)
+   .set(users::email.set(bind("backfilled@example.com")))
+   .from(posts::table)
+   .where_(posts::user_id.eq(users::id))
+
+// delete from t using other where ...
+dsl.delete_from(users::table)
+   .using(posts::table)
+   .where_(posts::user_id.eq(users::id).and(posts::id.gt(bind(10_i64))))
+```
+
+### bulk inserts via binary COPY
+
+for high-volume inserts, `dsl.copy_in_binary(...)` runs `COPY ... FROM STDIN
+BINARY` against the executor and gives you a typed writer:
+
+```rust
+dsl.copy_in_binary(
+    users::table,
+    (users::email, users::active),
+    async |writer| {
+        writer.send(("a@example.com".to_owned(), true)).await?;
+        writer.send(("b@example.com".to_owned(), true)).await?;
+        Ok(())
+    },
+).await?;
+```
+
+works for tuples up to 8 columns. row tuple types track each column's
+nullability (`Field<T, NotNull>` -> `T`, `Field<T, Nullable>` -> `Option<T>`).
 
 ### upsert (`on conflict do update`)
 
@@ -378,40 +651,31 @@ fuwa-codegen snapshot \
   --out fuwa.schema.json
 ```
 
-for build scripts, call the library entry point and fall back to a checked-in
-snapshot when `FUWA_OFFLINE=1` or the database is unavailable:
+for build scripts, the one-liner `fuwa_codegen::build::run()` reads
+`DATABASE_URL`, falls back to `fuwa.schema.json` if the database is unreachable,
+emits the right `cargo:rerun-if-*` directives, and writes `schema.rs` into
+`$OUT_DIR`:
 
 ```rust
 // build.rs
-use std::{env, fs, path::PathBuf};
-
-use fuwa_codegen::{generate, CodegenSource, GenerateOptions, SchemaSnapshot};
-
 fn main() {
-    println!("cargo:rerun-if-env-changed=DATABASE_URL");
-    println!("cargo:rerun-if-env-changed=FUWA_OFFLINE");
-    println!("cargo:rerun-if-changed=fuwa.schema.json");
+    fuwa_codegen::build::run().unwrap();
+}
+```
 
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("schema.rs");
-    let snapshot = PathBuf::from("fuwa.schema.json");
+set `FUWA_OFFLINE=1` to force snapshot use ~ handy in CI without postgres. for
+non-default options use `Builder` directly:
 
-    let generated = if env::var_os("FUWA_OFFLINE").is_some() {
-        generate(GenerateOptions::new(CodegenSource::Snapshot(snapshot))).unwrap()
-    } else {
-        let database_url = env::var("DATABASE_URL").unwrap();
-        generate(GenerateOptions::new(CodegenSource::Database {
-            database_url,
-            schemas: vec!["public".to_owned()],
-            tables: Vec::new(),
-        }))
-        .or_else(|_| {
-            SchemaSnapshot::from_snapshot("fuwa.schema.json")
-                .and_then(|snapshot| generate(GenerateOptions::new(CodegenSource::SnapshotValue(snapshot))))
-        })
-        .unwrap()
-    };
-
-    fs::write(out, generated).unwrap();
+```rust
+// build.rs
+fn main() {
+    fuwa_codegen::build::Builder::new()
+        .schemas(["public", "auth"])
+        .tables(["users", "posts"])
+        .snapshot_path("fuwa.schema.json")
+        .out_filename("schema.rs")
+        .run()
+        .unwrap();
 }
 ```
 
@@ -425,7 +689,8 @@ pub mod schema {
 ```
 
 generated modules come with `Table` constants, typed `Field<T, Nullability>`
-constants, a `Record` struct, a `FromRow` impl, + an `all()` selection helper:
+constants, a `Record` struct, `FromRow` + `Assignments` impls, + an `all()`
+selection helper:
 
 ```rust
 pub mod users {
@@ -444,11 +709,17 @@ pub mod users {
         // plus the rest of the table columns
     }
 
-    pub fn all() -> All {
-        All
-    }
+    impl fuwa::FromRow for Record { /* read every column by index */ }
+    impl fuwa::Assignments for Record { /* set every column from self.<col> */ }
+
+    pub fn all() -> All { All }
 }
 ```
+
+the auto-emitted `Assignments` covers every column on the table, so
+`dsl.insert_into(users::table).value(record)` works as a one-liner full-row
+insert. for tables with `bigserial` PKs (where you don't want to send `id`),
+hand-derive a narrower `#[derive(Insertable)]` struct as shown earlier.
 
 ### 4. import the generated schema
 
@@ -486,7 +757,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .select(users::all())
         .from(users::table)
         .where_(users::active.eq(true))
-        .fetch_all::<users::Record>()
+        .fetch_all()
         .await?;
 
     Ok(())
@@ -524,7 +795,7 @@ async fn handler(State(state): State<AppState>) -> fuwa::Result<String> {
         .select(users::email)
         .from(users::table)
         .where_(users::active.eq(true))
-        .fetch_all::<String>()
+        .fetch_all()
         .await?;
 
     Ok(format!("{emails:?}"))
@@ -540,56 +811,53 @@ back when the callback returns an error:
 ```rust
 use fuwa::prelude::*;
 
-async fn transaction_example(
-    dsl: DslContext<Pool>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    dsl.transaction(|dsl| {
-        Box::pin(async move {
-            dsl.insert_into(users::table)
-                .values((
-                    users::email.set("queued@example.com"),
-                    users::active.set(true),
-                ))
-                .execute()
-                .await?;
+async fn transaction_example(dsl: DslContext<Pool>) -> fuwa::Result<()> {
+    dsl.transaction(async |dsl| {
+        dsl.insert_into(users::table)
+            .values((
+                users::email.set("queued@example.com"),
+                users::active.set(true),
+            ))
+            .execute()
+            .await?;
 
-            Ok(())
-        })
+        Ok(())
     })
-    .await?;
-
-    Ok(())
+    .await
 }
 ```
 
 ## postgres streaming
 
 `fetch_stream` and `fetch_chunked` use PostgreSQL portals for server-side
-streaming. Portals only live for the duration of a transaction, so bind a DSL
+streaming. portals only live for the duration of a transaction, so the methods
+are bounded on the `TransactionalExecutor` trait ~ calling them on a `Pool` or
+bare `Client` is a **compile error**, not a runtime surprise. bind a DSL
 context to an open transaction and keep it alive until the stream is exhausted
 or dropped:
 
 ```rust
+mod schema;
+
 use fuwa::prelude::*;
+use schema::users;
 
-async fn stream_example(
-    dsl: DslContext<Pool>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    dsl.transaction(|dsl| {
-        Box::pin(async move {
-            let mut chunks = dsl
-                .raw("select id, email from users order by id")
-                .fetch_chunked::<(i64, String)>(500)
-                .await?;
+async fn stream_example(dsl: DslContext<Pool>) -> fuwa::Result<()> {
+    dsl.transaction(async |dsl| {
+        let mut chunks = dsl
+            .select((users::id, users::email))
+            .from(users::table)
+            .order_by(users::id.asc())
+            .fetch_chunked(500)
+            .await?;
 
-            while let Some(chunk) = chunks.next().await {
-                for (id, email) in chunk? {
-                    println!("{id}: {email}");
-                }
+        while let Some(chunk) = chunks.next().await {
+            for (id, email) in chunk? {
+                println!("{id}: {email}");
             }
+        }
 
-            Ok(())
-        })
+        Ok(())
     })
     .await?;
 
@@ -608,12 +876,127 @@ async fn raw_example(dsl: &DslContext<Pool>) -> fuwa::Result<()> {
     let rows = dsl
         .raw(r#"select email from users where email ~* $1"#)
         .bind(r"@example\.com$")
-        .fetch_all::<String>()
+        .fetch_all_as::<String>()
         .await?;
 
     println!("{rows:?}");
     Ok(())
 }
+```
+
+### compile-time-checked raw SQL
+
+for raw SQL that should still get a sanity check, the `query!` macro
+validates every `table.column` reference against `fuwa.schema.json` at compile
+time (no live DB hit needed):
+
+```rust
+use fuwa::prelude::*;
+
+async fn checked_raw(dsl: &DslContext<Pool>) -> fuwa::Result<Vec<String>> {
+    let sql: &str = fuwa::query!(
+        "select users.email from users where users.id = $1"
+    );
+    dsl.raw(sql).bind(7_i64).fetch_all_as::<String>().await
+}
+```
+
+a typo'd column (e.g. `users.emial`) becomes a `cargo check` error pointing
+at the macro call. set `FUWA_QUERY_SNAPSHOT` to override the snapshot path
+(defaults to `$CARGO_MANIFEST_DIR/fuwa.schema.json`).
+
+## error taxonomy
+
+`fuwa::Error` exposes typed variants for the common postgres SQLSTATE codes
+so callers can match on them directly without parsing strings:
+
+```rust
+use fuwa::Error;
+
+match dsl.insert_into(...).execute().await {
+    Err(Error::UniqueViolation { constraint, .. }) => { /* idempotent retry */ }
+    Err(Error::SerializationFailure(_)) | Err(Error::DeadlockDetected(_)) => {
+        // retry the transaction
+    }
+    Err(other) => return Err(other.into()),
+    Ok(rows) => { /* ok */ }
+}
+```
+
+variants: `UniqueViolation`, `ForeignKeyViolation`, `CheckViolation`,
+`NotNullViolation`, `SerializationFailure`, `DeadlockDetected`. anything that
+doesn't map falls through to `Error::Postgres { sqlstate, message }`.
+
+## tracing
+
+every `execute` / `fetch_*` emits a `debug` `tracing` span carrying the
+rendered SQL, bind count, and rows affected. enable a subscriber to see them.
+the `tracing` feature is on by default; turn it off with
+`fuwa-postgres = { ..., default-features = false }` if you need a leaner
+build.
+
+## dynamic query composition
+
+`Condition::all([..])` and `Condition::any([..])` fold an iterator of
+predicates with `AND` / `OR`. an empty iterator returns `TRUE` / `FALSE` so
+you can build filter sets without special-casing the empty case:
+
+```rust
+use fuwa::prelude::*;
+
+let mut filters: Vec<Condition> = Vec::new();
+if let Some(active) = active_filter {
+    filters.push(users::active.eq(active));
+}
+if let Some(rank) = rank_filter {
+    filters.push(users::signup_rank.gt(rank));
+}
+dsl.select(users::id)
+   .from(users::table)
+   .where_(Condition::all(filters))
+```
+
+`.filter(...)` is also accepted as a diesel-style alias for `.where_(...)`.
+
+for accumulating filters one-at-a-time across a function body, `and_where` /
+`and_having` and the `push_*` helpers keep the query type stable through a
+mutation loop:
+
+```rust
+let mut q = select((users::id, users::email)).from(users::table);
+
+if let Some(active) = active_filter {
+    q = q.and_where(users::active.eq(active));
+}
+if let Some(rank) = rank_filter {
+    q = q.and_where(users::signup_rank.gt(rank));
+}
+for sort in requested_sorts {
+    q = q.push_order_by(sort);
+}
+let rows = dsl.fetch_all(q).await?;
+```
+
+`push_select_item`, `push_order_by`, `push_join`, and `push_group_by` accept
+the bare AST nodes (`SelectItem`, `OrderExpr`, `Join`, `ExprNode`) when you
+need to vary the projection / sort / joins by request input. they don't change
+the query's record type, so dynamic columns need an explicit `fetch_all_as::<T>()`
+to choose how rows decode.
+
+### inspecting rendered SQL
+
+every query type has a `.render()` (consuming) and a `.render_ref(&self)`
+(borrow) that returns a `RenderedQuery`. `RenderedQuery` impls `Display`, so
+`println!("{q}", q = q.render_ref()?)` and `dbg!(q.render_ref()?)` print the
+SQL with `$N` placeholders without consuming the builder.
+
+```rust
+let q = select((users::id, users::email))
+    .from(users::table)
+    .where_(users::active.eq(true));
+
+println!("{}", q.render_ref()?); // select "users"."id", "users"."email" from ...
+let rows = dsl.fetch_all(q).await?;
 ```
 
 ## local postgres tests

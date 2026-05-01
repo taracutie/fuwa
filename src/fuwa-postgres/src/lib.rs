@@ -1,5 +1,8 @@
 //! Async `tokio-postgres` execution and row decoding for `fuwa`.
 
+mod copy;
+mod pg_error;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,10 +12,14 @@ use futures_util::stream;
 pub use futures_util::StreamExt;
 use fuwa_core::{
     raw, AliasedSubquery, Assignments, ConflictTarget, Context, DeleteQuery, Excluded, ExprList,
-    InOperand, InOperandNode, InsertConflictBuilder, InsertQuery, JoinTarget, OrderByList,
-    RawQuery, RenderQuery, RenderedQuery, SelectQuery, Selectable, Table, TableSource, UpdateQuery,
-    WithBuilder,
+    InOperand, InOperandNode, InsertConflictBuilder, InsertQuery, IntoExistsQuery, JoinTarget,
+    NotSingleColumn, OrderByList, RawQuery, RenderQuery, RenderedQuery, SelectQuery, Selectable,
+    Table, TableSource, UpdateQuery, WithBuilder,
 };
+
+use copy::copy_in_binary_with_executor;
+pub use copy::{CopyInColumn, CopyInColumnMeta, CopyInColumns, CopyInRow, CopyInWriter, PgType};
+use pg_error::map_pg_error;
 pub use tokio_postgres::types;
 use tokio_postgres::types::FromSqlOwned;
 pub use tokio_postgres::Row;
@@ -31,7 +38,7 @@ pub type TransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Sen
 
 const DEFAULT_PORTAL_FETCH_ROWS: i32 = 1024;
 const STREAMING_REQUIRES_TRANSACTION: &str =
-    "fetch_stream and fetch_chunked require an existing transaction; wrap the call in dsl.transaction(|dsl| ...)";
+    "fetch_stream and fetch_chunked require an existing transaction; wrap the call in dsl.transaction(async |dsl| { ... })";
 
 /// Pool construction options for fuwa's default PostgreSQL pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +117,13 @@ pub trait Executor: Sync {
     fn acquire(&self) -> PgFuture<'_, Self::Conn<'_>>;
 }
 
+/// Marker for executors that yield a transaction-bound connection.
+///
+/// Implemented for `&Transaction<'_>` and friends. Methods that require a
+/// PostgreSQL portal (e.g. `fetch_stream` / `fetch_chunked`) are bounded on
+/// this trait so calling them on a pool or bare client is a compile error.
+pub trait TransactionalExecutor: Executor {}
+
 #[doc(hidden)]
 pub trait AcquiredConnection {
     type Client: GenericClient + Sync + ?Sized;
@@ -118,6 +132,19 @@ pub trait AcquiredConnection {
 
     fn as_transaction(&self) -> Option<&Transaction<'_>> {
         None
+    }
+
+    /// Open a binary `COPY ... FROM STDIN` sink against the underlying connection.
+    fn copy_in_binary_sink<'a>(
+        &'a self,
+        _sql: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio_postgres::CopyInSink<bytes::Bytes>>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(Error::execution(
+                "copy_in is not supported by this connection type",
+            ))
+        })
     }
 }
 
@@ -142,6 +169,18 @@ impl<'client> AcquiredConnection for &'client Client {
 
     fn as_client(&self) -> &Self::Client {
         self
+    }
+
+    fn copy_in_binary_sink<'a>(
+        &'a self,
+        sql: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio_postgres::CopyInSink<bytes::Bytes>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Client::copy_in::<_, bytes::Bytes>(self, sql)
+                .await
+                .map_err(map_pg_error)
+        })
     }
 }
 
@@ -170,6 +209,11 @@ where
     }
 }
 
+impl<'transaction, 'client> TransactionalExecutor for &'transaction Transaction<'client> where
+    'client: 'transaction
+{
+}
+
 impl<'transaction, 'client> Executor for &'transaction mut Transaction<'client>
 where
     'client: 'transaction,
@@ -184,6 +228,11 @@ where
     }
 }
 
+impl<'transaction, 'client> TransactionalExecutor for &'transaction mut Transaction<'client> where
+    'client: 'transaction
+{
+}
+
 impl<'transaction, 'client> AcquiredConnection for &'transaction Transaction<'client>
 where
     'client: 'transaction,
@@ -196,6 +245,18 @@ where
 
     fn as_transaction(&self) -> Option<&Transaction<'_>> {
         Some(*self)
+    }
+
+    fn copy_in_binary_sink<'a>(
+        &'a self,
+        sql: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio_postgres::CopyInSink<bytes::Bytes>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Transaction::copy_in::<_, bytes::Bytes>(self, sql)
+                .await
+                .map_err(map_pg_error)
+        })
     }
 }
 
@@ -234,6 +295,18 @@ impl AcquiredConnection for deadpool_postgres::Client {
     fn as_client(&self) -> &Self::Client {
         &***self
     }
+
+    fn copy_in_binary_sink<'a>(
+        &'a self,
+        sql: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio_postgres::CopyInSink<bytes::Bytes>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Client::copy_in::<_, bytes::Bytes>(&***self, sql)
+                .await
+                .map_err(map_pg_error)
+        })
+    }
 }
 
 impl TransactionConnection for deadpool_postgres::Client {
@@ -270,6 +343,18 @@ where
 
     fn as_client(&self) -> &Self::Client {
         self
+    }
+
+    fn copy_in_binary_sink<'a>(
+        &'a self,
+        sql: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio_postgres::CopyInSink<bytes::Bytes>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Client::copy_in::<_, bytes::Bytes>(self, sql)
+                .await
+                .map_err(map_pg_error)
+        })
     }
 }
 
@@ -361,23 +446,99 @@ where
             executor: &self.executor,
         }
     }
+
+    /// Run any built query (free-function form) and decode rows.
+    pub fn fetch_all<'a, Q>(&'a self, query: Q) -> PgFuture<'a, Vec<Q::Row>>
+    where
+        Q: fuwa_core::Query + Send + 'a,
+        Q::Row: FromRow + Send + 'a,
+    {
+        fetch_all_query(&self.executor, query)
+    }
+
+    /// Run any built query and decode rows into an explicit override type.
+    pub fn fetch_all_as<'a, Q, Row>(&'a self, query: Q) -> PgFuture<'a, Vec<Row>>
+    where
+        Q: RenderQuery + Send + 'a,
+        Row: FromRow + Send + 'a,
+    {
+        fetch_all_query(&self.executor, query)
+    }
+
+    /// Run any built query and decode exactly one row.
+    pub fn fetch_one<'a, Q>(&'a self, query: Q) -> PgFuture<'a, Q::Row>
+    where
+        Q: fuwa_core::Query + Send + 'a,
+        Q::Row: FromRow + Send + 'a,
+    {
+        fetch_one_query(&self.executor, query)
+    }
+
+    pub fn fetch_one_as<'a, Q, Row>(&'a self, query: Q) -> PgFuture<'a, Row>
+    where
+        Q: RenderQuery + Send + 'a,
+        Row: FromRow + Send + 'a,
+    {
+        fetch_one_query(&self.executor, query)
+    }
+
+    /// Run any built query and decode an optional row.
+    pub fn fetch_optional<'a, Q>(&'a self, query: Q) -> PgFuture<'a, Option<Q::Row>>
+    where
+        Q: fuwa_core::Query + Send + 'a,
+        Q::Row: FromRow + Send + 'a,
+    {
+        fetch_optional_query(&self.executor, query)
+    }
+
+    pub fn fetch_optional_as<'a, Q, Row>(&'a self, query: Q) -> PgFuture<'a, Option<Row>>
+    where
+        Q: RenderQuery + Send + 'a,
+        Row: FromRow + Send + 'a,
+    {
+        fetch_optional_query(&self.executor, query)
+    }
+
+    /// Run any built query and return rows-affected.
+    pub fn execute<'a, Q>(&'a self, query: Q) -> PgFuture<'a, u64>
+    where
+        Q: RenderQuery + Send + 'a,
+    {
+        execute_query(&self.executor, query)
+    }
+
+    /// Run a typed binary `COPY ... FROM STDIN` against this executor.
+    ///
+    /// The closure receives a [`CopyInWriter`] for sending rows; the writer is
+    /// committed when the closure returns and the row count is returned.
+    pub async fn copy_in_binary<C, F>(&self, table: Table, columns: C, f: F) -> Result<u64>
+    where
+        C: CopyInColumns,
+        F: for<'w> AsyncFnOnce(&'w mut CopyInWriter<C::Row>) -> Result<()>,
+    {
+        copy_in_binary_with_executor(&self.executor, table, columns, f).await
+    }
+
+    /// Send a `NOTIFY channel, 'payload'` via `pg_notify(...)`.
+    pub async fn notify(&self, channel: &str, payload: Option<&str>) -> Result<()> {
+        let attached = self
+            .raw("select pg_notify($1, $2)")
+            .bind(channel.to_owned());
+        let attached = attached.bind(payload.unwrap_or("").to_owned());
+        attached.execute().await?;
+        Ok(())
+    }
 }
 
 async fn transaction_with_client<F, T>(client: &mut Client, f: F) -> Result<T>
 where
-    F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
+    F: for<'tx> AsyncFnOnce(DslContext<&'tx Transaction<'tx>>) -> Result<T>,
 {
-    let transaction = client
-        .transaction()
-        .await
-        .map_err(|err| Error::execution(err.to_string()))?;
+    let transaction = client.transaction().await.map_err(map_pg_error)?;
 
     match f(DslContext::new(&transaction)).await {
         Ok(value) => {
-            transaction
-                .commit()
-                .await
-                .map_err(|err| Error::execution(err.to_string()))?;
+            transaction.commit().await.map_err(map_pg_error)?;
             Ok(value)
         }
         Err(err) => {
@@ -393,19 +554,13 @@ where
 
 async fn transaction_with_transaction<F, T>(transaction: &mut Transaction<'_>, f: F) -> Result<T>
 where
-    F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
+    F: for<'tx> AsyncFnOnce(DslContext<&'tx Transaction<'tx>>) -> Result<T>,
 {
-    let transaction = transaction
-        .transaction()
-        .await
-        .map_err(|err| Error::execution(err.to_string()))?;
+    let transaction = transaction.transaction().await.map_err(map_pg_error)?;
 
     match f(DslContext::new(&transaction)).await {
         Ok(value) => {
-            transaction
-                .commit()
-                .await
-                .map_err(|err| Error::execution(err.to_string()))?;
+            transaction.commit().await.map_err(map_pg_error)?;
             Ok(value)
         }
         Err(err) => {
@@ -427,7 +582,7 @@ where
     /// Run a closure inside a PostgreSQL transaction.
     pub async fn transaction<F, T>(&self, f: F) -> Result<T>
     where
-        F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
+        F: for<'tx> AsyncFnOnce(DslContext<&'tx Transaction<'tx>>) -> Result<T>,
     {
         let mut conn = self.executor.acquire().await?;
         transaction_with_client(conn.as_client_mut(), f).await
@@ -438,7 +593,7 @@ impl DslContext<&Client> {
     /// Reuse this connection for several queries in one callback.
     pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
     where
-        F: for<'conn> FnOnce(DslContext<&'conn Client>) -> TransactionFuture<'conn, T>,
+        F: for<'conn> AsyncFnOnce(DslContext<&'conn Client>) -> Result<T>,
     {
         f(DslContext::new(self.executor)).await
     }
@@ -448,7 +603,7 @@ impl DslContext<&mut Client> {
     /// Run a closure inside a PostgreSQL transaction.
     pub async fn transaction<F, T>(&mut self, f: F) -> Result<T>
     where
-        F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
+        F: for<'tx> AsyncFnOnce(DslContext<&'tx Transaction<'tx>>) -> Result<T>,
     {
         transaction_with_client(self.executor, f).await
     }
@@ -456,7 +611,7 @@ impl DslContext<&mut Client> {
     /// Reuse this connection for several queries in one callback.
     pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
     where
-        F: for<'conn> FnOnce(DslContext<&'conn Client>) -> TransactionFuture<'conn, T>,
+        F: for<'conn> AsyncFnOnce(DslContext<&'conn Client>) -> Result<T>,
     {
         f(DslContext::new(&*self.executor)).await
     }
@@ -469,7 +624,7 @@ where
     /// Run a closure inside a nested PostgreSQL transaction.
     pub async fn transaction<F, T>(&mut self, f: F) -> Result<T>
     where
-        F: for<'tx> FnOnce(DslContext<&'tx Transaction<'tx>>) -> TransactionFuture<'tx, T>,
+        F: for<'tx> AsyncFnOnce(DslContext<&'tx Transaction<'tx>>) -> Result<T>,
     {
         transaction_with_transaction(self.executor, f).await
     }
@@ -482,9 +637,7 @@ where
     /// Reuse this transaction for several queries in one callback.
     pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
     where
-        F: for<'conn> FnOnce(
-            DslContext<&'conn Transaction<'client>>,
-        ) -> TransactionFuture<'conn, T>,
+        F: for<'conn> AsyncFnOnce(DslContext<&'conn Transaction<'client>>) -> Result<T>,
     {
         f(DslContext::new(self.executor)).await
     }
@@ -494,7 +647,7 @@ impl DslContext<Pool> {
     /// Acquire one physical connection and run multiple queries against it.
     pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
     where
-        F: for<'conn> FnOnce(DslContext<&'conn Client>) -> TransactionFuture<'conn, T>,
+        F: for<'conn> AsyncFnOnce(DslContext<&'conn Client>) -> Result<T>,
     {
         let conn = self.executor.acquire().await?;
         f(DslContext::new(conn.as_client())).await
@@ -510,7 +663,7 @@ where
     /// Acquire one physical connection and run multiple queries against it.
     pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
     where
-        F: for<'conn> FnOnce(DslContext<&'conn Client>) -> TransactionFuture<'conn, T>,
+        F: for<'conn> AsyncFnOnce(DslContext<&'conn Client>) -> Result<T>,
     {
         let conn = self.executor.acquire().await?;
         f(DslContext::new(conn.as_client())).await
@@ -557,6 +710,7 @@ impl_scalar_from_row!(
     i16,
     i32,
     i64,
+    u32,
     f32,
     f64,
     bool,
@@ -659,7 +813,7 @@ where
                 let row_stream = transaction
                     .query_portal_raw(&state.portal, DEFAULT_PORTAL_FETCH_ROWS)
                     .await
-                    .map_err(|err| Error::execution(err.to_string()))?;
+                    .map_err(map_pg_error)?;
                 state.current = Some(Box::pin(row_stream));
                 state.current_yielded = false;
             }
@@ -668,7 +822,7 @@ where
             match row_stream.as_mut().next().await {
                 Some(row) => {
                     state.current_yielded = true;
-                    let row = row.map_err(|err| Error::execution(err.to_string()))?;
+                    let row = row.map_err(map_pg_error)?;
                     return R::from_row(&row).map(|row| Some((row, state)));
                 }
                 None => {
@@ -696,11 +850,25 @@ where
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
+        #[cfg(feature = "tracing")]
+        let span = tracing::debug_span!(
+            "fuwa.execute",
+            sql = %rendered.sql(),
+            bind_count = params.len()
+        );
+        #[cfg(feature = "tracing")]
+        let _enter = span.enter();
         let conn = executor.acquire().await?;
-        conn.as_client()
+        let result = conn
+            .as_client()
             .execute(rendered.sql(), params.as_slice())
             .await
-            .map_err(|err| Error::execution(err.to_string()))
+            .map_err(map_pg_error);
+        #[cfg(feature = "tracing")]
+        if let Ok(rows) = &result {
+            tracing::debug!(rows_affected = rows, "execute succeeded");
+        }
+        result
     })
 }
 
@@ -713,13 +881,23 @@ where
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
+        #[cfg(feature = "tracing")]
+        let span = tracing::debug_span!(
+            "fuwa.fetch_all",
+            sql = %rendered.sql(),
+            bind_count = params.len()
+        );
+        #[cfg(feature = "tracing")]
+        let _enter = span.enter();
         let rows = {
             let conn = executor.acquire().await?;
             conn.as_client()
                 .query(rendered.sql(), params.as_slice())
                 .await
-                .map_err(|err| Error::execution(err.to_string()))?
+                .map_err(map_pg_error)?
         };
+        #[cfg(feature = "tracing")]
+        tracing::debug!(rows = rows.len(), "fetch_all succeeded");
 
         rows.iter().map(R::from_row).collect()
     })
@@ -734,12 +912,20 @@ where
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
+        #[cfg(feature = "tracing")]
+        let span = tracing::debug_span!(
+            "fuwa.fetch_one",
+            sql = %rendered.sql(),
+            bind_count = params.len()
+        );
+        #[cfg(feature = "tracing")]
+        let _enter = span.enter();
         let row = {
             let conn = executor.acquire().await?;
             conn.as_client()
                 .query_one(rendered.sql(), params.as_slice())
                 .await
-                .map_err(|err| Error::execution(err.to_string()))?
+                .map_err(map_pg_error)?
         };
 
         R::from_row(&row)
@@ -755,12 +941,20 @@ where
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
+        #[cfg(feature = "tracing")]
+        let span = tracing::debug_span!(
+            "fuwa.fetch_optional",
+            sql = %rendered.sql(),
+            bind_count = params.len()
+        );
+        #[cfg(feature = "tracing")]
+        let _enter = span.enter();
         let row = {
             let conn = executor.acquire().await?;
             conn.as_client()
                 .query_opt(rendered.sql(), params.as_slice())
                 .await
-                .map_err(|err| Error::execution(err.to_string()))?
+                .map_err(map_pg_error)?
         };
 
         row.as_ref().map(R::from_row).transpose()
@@ -776,6 +970,13 @@ where
     Box::pin(async move {
         let rendered = query.render()?;
         let params = rendered.bind_refs();
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            target: "fuwa",
+            sql = %rendered.sql(),
+            bind_count = params.len(),
+            "fetch_stream"
+        );
         let conn = executor.acquire().await?;
         let transaction = conn
             .as_transaction()
@@ -783,7 +984,7 @@ where
         let portal = transaction
             .bind(rendered.sql(), params.as_slice())
             .await
-            .map_err(|err| Error::execution(err.to_string()))?;
+            .map_err(map_pg_error)?;
 
         Ok(portal_stream(conn, portal))
     })
@@ -865,6 +1066,12 @@ impl<'a, E: Executor, T, R> InOperand<T> for AttachedSelectQuery<'a, E, R, T> {
     }
 }
 
+impl<'a, E: Executor, R, S> IntoExistsQuery<R, S> for AttachedSelectQuery<'a, E, R, S> {
+    fn into_select_query(self) -> SelectQuery<(), NotSingleColumn> {
+        <SelectQuery<R, S> as IntoExistsQuery<R, S>>::into_select_query(self.query)
+    }
+}
+
 impl<'a, E, R, S> AttachedSelectQuery<'a, E, R, S>
 where
     E: Executor,
@@ -910,11 +1117,218 @@ where
         }
     }
 
-    pub fn where_(self, condition: fuwa_core::Condition) -> Self {
+    pub fn right_join(self, target: JoinTarget) -> Self {
+        Self {
+            query: self.query.right_join(target),
+            executor: self.executor,
+        }
+    }
+
+    pub fn full_join(self, target: JoinTarget) -> Self {
+        Self {
+            query: self.query.full_join(target),
+            executor: self.executor,
+        }
+    }
+
+    pub fn cross_join<T>(self, source: T) -> Self
+    where
+        T: TableSource,
+    {
+        Self {
+            query: self.query.cross_join(source),
+            executor: self.executor,
+        }
+    }
+
+    pub fn join_lateral(self, target: JoinTarget) -> Self {
+        Self {
+            query: self.query.join_lateral(target),
+            executor: self.executor,
+        }
+    }
+
+    pub fn left_join_lateral(self, target: JoinTarget) -> Self {
+        Self {
+            query: self.query.left_join_lateral(target),
+            executor: self.executor,
+        }
+    }
+
+    pub fn cross_join_lateral<T>(self, source: T) -> Self
+    where
+        T: TableSource,
+    {
+        Self {
+            query: self.query.cross_join_lateral(source),
+            executor: self.executor,
+        }
+    }
+
+    pub fn for_update(self) -> Self {
+        Self {
+            query: self.query.for_update(),
+            executor: self.executor,
+        }
+    }
+
+    pub fn for_no_key_update(self) -> Self {
+        Self {
+            query: self.query.for_no_key_update(),
+            executor: self.executor,
+        }
+    }
+
+    pub fn for_share(self) -> Self {
+        Self {
+            query: self.query.for_share(),
+            executor: self.executor,
+        }
+    }
+
+    pub fn for_key_share(self) -> Self {
+        Self {
+            query: self.query.for_key_share(),
+            executor: self.executor,
+        }
+    }
+
+    pub fn of<L>(self, tables: L) -> Self
+    where
+        L: fuwa_core::LockTargetList,
+    {
+        Self {
+            query: self.query.of(tables),
+            executor: self.executor,
+        }
+    }
+
+    pub fn skip_locked(self) -> Self {
+        Self {
+            query: self.query.skip_locked(),
+            executor: self.executor,
+        }
+    }
+
+    pub fn no_wait(self) -> Self {
+        Self {
+            query: self.query.no_wait(),
+            executor: self.executor,
+        }
+    }
+
+    pub fn union<Q>(self, other: Q) -> Self
+    where
+        Q: IntoDetachedSelectQuery<R, S>,
+    {
+        Self {
+            query: self.query.union(other.into_select_query()),
+            executor: self.executor,
+        }
+    }
+
+    pub fn union_all<Q>(self, other: Q) -> Self
+    where
+        Q: IntoDetachedSelectQuery<R, S>,
+    {
+        Self {
+            query: self.query.union_all(other.into_select_query()),
+            executor: self.executor,
+        }
+    }
+
+    pub fn except<Q>(self, other: Q) -> Self
+    where
+        Q: IntoDetachedSelectQuery<R, S>,
+    {
+        Self {
+            query: self.query.except(other.into_select_query()),
+            executor: self.executor,
+        }
+    }
+
+    pub fn except_all<Q>(self, other: Q) -> Self
+    where
+        Q: IntoDetachedSelectQuery<R, S>,
+    {
+        Self {
+            query: self.query.except_all(other.into_select_query()),
+            executor: self.executor,
+        }
+    }
+
+    pub fn intersect<Q>(self, other: Q) -> Self
+    where
+        Q: IntoDetachedSelectQuery<R, S>,
+    {
+        Self {
+            query: self.query.intersect(other.into_select_query()),
+            executor: self.executor,
+        }
+    }
+
+    pub fn intersect_all<Q>(self, other: Q) -> Self
+    where
+        Q: IntoDetachedSelectQuery<R, S>,
+    {
+        Self {
+            query: self.query.intersect_all(other.into_select_query()),
+            executor: self.executor,
+        }
+    }
+
+    pub fn where_<C: fuwa_core::IntoCondition>(self, condition: C) -> Self {
         Self {
             query: self.query.where_(condition),
             executor: self.executor,
         }
+    }
+
+    /// AND another condition into WHERE (verb form for dynamic loops).
+    pub fn and_where<C: fuwa_core::IntoCondition>(self, condition: C) -> Self {
+        self.where_(condition)
+    }
+
+    /// AND another condition into HAVING (verb form for dynamic loops).
+    pub fn and_having<C: fuwa_core::IntoCondition>(self, condition: C) -> Self {
+        self.having(condition)
+    }
+
+    /// Append a raw `SelectItem` to the projection without re-typing the query.
+    pub fn push_select_item(self, item: fuwa_core::SelectItem) -> Self {
+        Self {
+            query: self.query.push_select_item(item),
+            executor: self.executor,
+        }
+    }
+
+    /// Append a raw `OrderExpr` to ORDER BY without re-typing the query.
+    pub fn push_order_by(self, order: fuwa_core::OrderExpr) -> Self {
+        Self {
+            query: self.query.push_order_by(order),
+            executor: self.executor,
+        }
+    }
+
+    /// Append a raw `Join` to the FROM clause without re-typing the query.
+    pub fn push_join(self, join: fuwa_core::Join) -> Self {
+        Self {
+            query: self.query.push_join(join),
+            executor: self.executor,
+        }
+    }
+
+    /// Append an `ExprNode` to GROUP BY without re-typing the query.
+    pub fn push_group_by(self, expr: fuwa_core::ExprNode) -> Self {
+        Self {
+            query: self.query.push_group_by(expr),
+            executor: self.executor,
+        }
+    }
+
+    /// Alias for [`where_`](Self::where_) for diesel-style ergonomics.
+    pub fn filter<C: fuwa_core::IntoCondition>(self, condition: C) -> Self {
+        self.where_(condition)
     }
 
     pub fn group_by<GroupBy>(self, group_by: GroupBy) -> Self
@@ -927,7 +1341,7 @@ where
         }
     }
 
-    pub fn having(self, condition: fuwa_core::Condition) -> Self {
+    pub fn having<C: fuwa_core::IntoCondition>(self, condition: C) -> Self {
         Self {
             query: self.query.having(condition),
             executor: self.executor,
@@ -966,6 +1380,11 @@ where
         self.query.render()
     }
 
+    /// Render this query without consuming it.
+    pub fn render_ref(&self) -> Result<RenderedQuery> {
+        self.query.render_ref()
+    }
+
     pub fn execute(self) -> PgFuture<'a, u64>
     where
         SelectQuery<R, S>: Send + 'a,
@@ -973,7 +1392,17 @@ where
         execute_query(self.executor, self.query)
     }
 
-    pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
+    /// Run the query and decode each row into the projection's record type.
+    pub fn fetch_all(self) -> PgFuture<'a, Vec<R>>
+    where
+        SelectQuery<R, S>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_all_query(self.executor, self.query)
+    }
+
+    /// Run the query and decode each row into an explicit override type.
+    pub fn fetch_all_as<Row>(self) -> PgFuture<'a, Vec<Row>>
     where
         SelectQuery<R, S>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -981,7 +1410,15 @@ where
         fetch_all_query(self.executor, self.query)
     }
 
-    pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
+    pub fn fetch_one(self) -> PgFuture<'a, R>
+    where
+        SelectQuery<R, S>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_one_query(self.executor, self.query)
+    }
+
+    pub fn fetch_one_as<Row>(self) -> PgFuture<'a, Row>
     where
         SelectQuery<R, S>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -989,7 +1426,15 @@ where
         fetch_one_query(self.executor, self.query)
     }
 
-    pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
+    pub fn fetch_optional(self) -> PgFuture<'a, Option<R>>
+    where
+        SelectQuery<R, S>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_optional_query(self.executor, self.query)
+    }
+
+    pub fn fetch_optional_as<Row>(self) -> PgFuture<'a, Option<Row>>
     where
         SelectQuery<R, S>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -997,16 +1442,36 @@ where
         fetch_optional_query(self.executor, self.query)
     }
 
-    pub fn fetch_stream<Row>(self) -> PgFuture<'a, PgStream<'a, Row>>
+    pub fn fetch_stream(self) -> PgFuture<'a, PgStream<'a, R>>
     where
+        E: TransactionalExecutor,
+        SelectQuery<R, S>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_stream_query(self.executor, self.query)
+    }
+
+    pub fn fetch_stream_as<Row>(self) -> PgFuture<'a, PgStream<'a, Row>>
+    where
+        E: TransactionalExecutor,
         SelectQuery<R, S>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
         fetch_stream_query(self.executor, self.query)
     }
 
-    pub fn fetch_chunked<Row>(self, n: usize) -> PgFuture<'a, PgStream<'a, Vec<Row>>>
+    pub fn fetch_chunked(self, n: usize) -> PgFuture<'a, PgStream<'a, Vec<R>>>
     where
+        E: TransactionalExecutor,
+        SelectQuery<R, S>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_chunked_query(self.executor, self.query, n)
+    }
+
+    pub fn fetch_chunked_as<Row>(self, n: usize) -> PgFuture<'a, PgStream<'a, Vec<Row>>>
+    where
+        E: TransactionalExecutor,
         SelectQuery<R, S>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
@@ -1063,6 +1528,14 @@ where
         }
     }
 
+    /// Insert a single record using its `Assignments` impl.
+    pub fn value<A>(self, record: A) -> Self
+    where
+        A: Assignments,
+    {
+        self.values(record)
+    }
+
     pub fn values_many<I, A>(self, rows: I) -> Self
     where
         I: IntoIterator<Item = A>,
@@ -1070,6 +1543,26 @@ where
     {
         Self {
             query: self.query.values_many(rows),
+            executor: self.executor,
+        }
+    }
+
+    pub fn columns<C>(self, columns: C) -> Self
+    where
+        C: ConflictTarget,
+    {
+        Self {
+            query: self.query.columns(columns),
+            executor: self.executor,
+        }
+    }
+
+    pub fn from_select<R2, S, Q>(self, query: Q) -> Self
+    where
+        Q: IntoDetachedSelectQuery<R2, S>,
+    {
+        Self {
+            query: self.query.from_select(query.into_select_query()),
             executor: self.executor,
         }
     }
@@ -1098,6 +1591,11 @@ where
         self.query.render()
     }
 
+    /// Render this query without consuming it.
+    pub fn render_ref(&self) -> Result<RenderedQuery> {
+        self.query.render_ref()
+    }
+
     pub fn execute(self) -> PgFuture<'a, u64>
     where
         InsertQuery<R>: Send + 'a,
@@ -1105,7 +1603,15 @@ where
         execute_query(self.executor, self.query)
     }
 
-    pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
+    pub fn fetch_all(self) -> PgFuture<'a, Vec<R>>
+    where
+        InsertQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_all_query(self.executor, self.query)
+    }
+
+    pub fn fetch_all_as<Row>(self) -> PgFuture<'a, Vec<Row>>
     where
         InsertQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1113,7 +1619,15 @@ where
         fetch_all_query(self.executor, self.query)
     }
 
-    pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
+    pub fn fetch_one(self) -> PgFuture<'a, R>
+    where
+        InsertQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_one_query(self.executor, self.query)
+    }
+
+    pub fn fetch_one_as<Row>(self) -> PgFuture<'a, Row>
     where
         InsertQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1121,7 +1635,15 @@ where
         fetch_one_query(self.executor, self.query)
     }
 
-    pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
+    pub fn fetch_optional(self) -> PgFuture<'a, Option<R>>
+    where
+        InsertQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_optional_query(self.executor, self.query)
+    }
+
+    pub fn fetch_optional_as<Row>(self) -> PgFuture<'a, Option<Row>>
     where
         InsertQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1177,11 +1699,26 @@ where
         }
     }
 
-    pub fn where_(self, condition: fuwa_core::Condition) -> Self {
+    pub fn from<S>(self, source: S) -> Self
+    where
+        S: TableSource,
+    {
+        Self {
+            query: self.query.from(source),
+            executor: self.executor,
+        }
+    }
+
+    pub fn where_<C: fuwa_core::IntoCondition>(self, condition: C) -> Self {
         Self {
             query: self.query.where_(condition),
             executor: self.executor,
         }
+    }
+
+    /// Alias for [`where_`](Self::where_) for diesel-style ergonomics.
+    pub fn filter<C: fuwa_core::IntoCondition>(self, condition: C) -> Self {
+        self.where_(condition)
     }
 
     pub fn returning<S>(self, selection: S) -> AttachedUpdateQuery<'a, E, S::Record>
@@ -1198,6 +1735,11 @@ where
         self.query.render()
     }
 
+    /// Render this query without consuming it.
+    pub fn render_ref(&self) -> Result<RenderedQuery> {
+        self.query.render_ref()
+    }
+
     pub fn execute(self) -> PgFuture<'a, u64>
     where
         UpdateQuery<R>: Send + 'a,
@@ -1205,7 +1747,15 @@ where
         execute_query(self.executor, self.query)
     }
 
-    pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
+    pub fn fetch_all(self) -> PgFuture<'a, Vec<R>>
+    where
+        UpdateQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_all_query(self.executor, self.query)
+    }
+
+    pub fn fetch_all_as<Row>(self) -> PgFuture<'a, Vec<Row>>
     where
         UpdateQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1213,7 +1763,15 @@ where
         fetch_all_query(self.executor, self.query)
     }
 
-    pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
+    pub fn fetch_one(self) -> PgFuture<'a, R>
+    where
+        UpdateQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_one_query(self.executor, self.query)
+    }
+
+    pub fn fetch_one_as<Row>(self) -> PgFuture<'a, Row>
     where
         UpdateQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1221,7 +1779,15 @@ where
         fetch_one_query(self.executor, self.query)
     }
 
-    pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
+    pub fn fetch_optional(self) -> PgFuture<'a, Option<R>>
+    where
+        UpdateQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_optional_query(self.executor, self.query)
+    }
+
+    pub fn fetch_optional_as<Row>(self) -> PgFuture<'a, Option<Row>>
     where
         UpdateQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1239,11 +1805,26 @@ impl<'a, E, R> AttachedDeleteQuery<'a, E, R>
 where
     E: Executor,
 {
-    pub fn where_(self, condition: fuwa_core::Condition) -> Self {
+    pub fn using<S>(self, source: S) -> Self
+    where
+        S: TableSource,
+    {
+        Self {
+            query: self.query.using(source),
+            executor: self.executor,
+        }
+    }
+
+    pub fn where_<C: fuwa_core::IntoCondition>(self, condition: C) -> Self {
         Self {
             query: self.query.where_(condition),
             executor: self.executor,
         }
+    }
+
+    /// Alias for [`where_`](Self::where_) for diesel-style ergonomics.
+    pub fn filter<C: fuwa_core::IntoCondition>(self, condition: C) -> Self {
+        self.where_(condition)
     }
 
     pub fn returning<S>(self, selection: S) -> AttachedDeleteQuery<'a, E, S::Record>
@@ -1260,6 +1841,11 @@ where
         self.query.render()
     }
 
+    /// Render this query without consuming it.
+    pub fn render_ref(&self) -> Result<RenderedQuery> {
+        self.query.render_ref()
+    }
+
     pub fn execute(self) -> PgFuture<'a, u64>
     where
         DeleteQuery<R>: Send + 'a,
@@ -1267,7 +1853,15 @@ where
         execute_query(self.executor, self.query)
     }
 
-    pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
+    pub fn fetch_all(self) -> PgFuture<'a, Vec<R>>
+    where
+        DeleteQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_all_query(self.executor, self.query)
+    }
+
+    pub fn fetch_all_as<Row>(self) -> PgFuture<'a, Vec<Row>>
     where
         DeleteQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1275,7 +1869,15 @@ where
         fetch_all_query(self.executor, self.query)
     }
 
-    pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
+    pub fn fetch_one(self) -> PgFuture<'a, R>
+    where
+        DeleteQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_one_query(self.executor, self.query)
+    }
+
+    pub fn fetch_one_as<Row>(self) -> PgFuture<'a, Row>
     where
         DeleteQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1283,7 +1885,15 @@ where
         fetch_one_query(self.executor, self.query)
     }
 
-    pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
+    pub fn fetch_optional(self) -> PgFuture<'a, Option<R>>
+    where
+        DeleteQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_optional_query(self.executor, self.query)
+    }
+
+    pub fn fetch_optional_as<Row>(self) -> PgFuture<'a, Option<Row>>
     where
         DeleteQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1322,6 +1932,11 @@ where
         self.query.render()
     }
 
+    /// Render this query without consuming it.
+    pub fn render_ref(&self) -> Result<RenderedQuery> {
+        self.query.render_ref()
+    }
+
     pub fn execute(self) -> PgFuture<'a, u64>
     where
         RawQuery<R>: Send + 'a,
@@ -1329,7 +1944,15 @@ where
         execute_query(self.executor, self.query)
     }
 
-    pub fn fetch_all<Row>(self) -> PgFuture<'a, Vec<Row>>
+    pub fn fetch_all(self) -> PgFuture<'a, Vec<R>>
+    where
+        RawQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_all_query(self.executor, self.query)
+    }
+
+    pub fn fetch_all_as<Row>(self) -> PgFuture<'a, Vec<Row>>
     where
         RawQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1337,7 +1960,15 @@ where
         fetch_all_query(self.executor, self.query)
     }
 
-    pub fn fetch_one<Row>(self) -> PgFuture<'a, Row>
+    pub fn fetch_one(self) -> PgFuture<'a, R>
+    where
+        RawQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_one_query(self.executor, self.query)
+    }
+
+    pub fn fetch_one_as<Row>(self) -> PgFuture<'a, Row>
     where
         RawQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1345,7 +1976,15 @@ where
         fetch_one_query(self.executor, self.query)
     }
 
-    pub fn fetch_optional<Row>(self) -> PgFuture<'a, Option<Row>>
+    pub fn fetch_optional(self) -> PgFuture<'a, Option<R>>
+    where
+        RawQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_optional_query(self.executor, self.query)
+    }
+
+    pub fn fetch_optional_as<Row>(self) -> PgFuture<'a, Option<Row>>
     where
         RawQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
@@ -1353,16 +1992,36 @@ where
         fetch_optional_query(self.executor, self.query)
     }
 
-    pub fn fetch_stream<Row>(self) -> PgFuture<'a, PgStream<'a, Row>>
+    pub fn fetch_stream(self) -> PgFuture<'a, PgStream<'a, R>>
     where
+        E: TransactionalExecutor,
+        RawQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_stream_query(self.executor, self.query)
+    }
+
+    pub fn fetch_stream_as<Row>(self) -> PgFuture<'a, PgStream<'a, Row>>
+    where
+        E: TransactionalExecutor,
         RawQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {
         fetch_stream_query(self.executor, self.query)
     }
 
-    pub fn fetch_chunked<Row>(self, n: usize) -> PgFuture<'a, PgStream<'a, Vec<Row>>>
+    pub fn fetch_chunked(self, n: usize) -> PgFuture<'a, PgStream<'a, Vec<R>>>
     where
+        E: TransactionalExecutor,
+        RawQuery<R>: Send + 'a,
+        R: FromRow + Send + 'a,
+    {
+        fetch_chunked_query(self.executor, self.query, n)
+    }
+
+    pub fn fetch_chunked_as<Row>(self, n: usize) -> PgFuture<'a, PgStream<'a, Vec<Row>>>
+    where
+        E: TransactionalExecutor,
         RawQuery<R>: Send + 'a,
         Row: FromRow + Send + 'a,
     {

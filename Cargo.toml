@@ -5,6 +5,7 @@ members = [
     "src/fuwa-derive",
     "src/fuwa-postgres",
     "src/fuwa-codegen",
+    "src/fuwa-query-macro",
 ]
 resolver = "2"
 
@@ -12,7 +13,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/taracutie/fuwa"
-rust-version = "1.80"
+rust-version = "1.85"
 
 [workspace.dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

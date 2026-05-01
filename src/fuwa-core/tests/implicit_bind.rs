@@ -77,9 +77,9 @@ fn list_comparators_implicitly_bind_values() {
             .and(users::EMAIL.not_in(["blocked@example.com", "spam@example.com"])),
     );
     let explicit = render_where(
-        users::ID.in_([bind(1_i64), bind(2_i64)]).and(
-            users::EMAIL.not_in([bind("blocked@example.com"), bind("spam@example.com")]),
-        ),
+        users::ID
+            .in_([bind(1_i64), bind(2_i64)])
+            .and(users::EMAIL.not_in([bind("blocked@example.com"), bind("spam@example.com")])),
     );
 
     assert_same_rendered(implicit, explicit);
@@ -118,7 +118,10 @@ fn assignments_implicitly_bind_values() {
 
     let implicit_update = Context::new()
         .update(users::TABLE)
-        .set((users::EMAIL.set("new@example.com"), users::ACTIVE.set(false)))
+        .set((
+            users::EMAIL.set("new@example.com"),
+            users::ACTIVE.set(false),
+        ))
         .where_(users::ID.eq(7_i64))
         .render()
         .unwrap();

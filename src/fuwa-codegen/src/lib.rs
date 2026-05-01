@@ -1,6 +1,8 @@
 //! PostgreSQL introspection and Rust schema generation for `fuwa-codegen`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use fuwa_core::{Error, Result};
@@ -8,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::GenericClient;
 use tokio_postgres::NoTls;
 
+pub mod build;
 mod prisma;
 
 /// PostgreSQL startup options used by `fuwa-codegen` connections.
@@ -195,13 +198,9 @@ impl SchemaSnapshot {
             .into_iter()
             .map(|filter| filter.as_ref().clone())
             .collect();
-        let database_url = database_url.to_owned();
-        block_on_codegen(async move {
-            let schema =
-                introspect_database_url_read_only(&database_url, &schema_names, &table_filters)
-                    .await?;
-            Ok(Self::new(schema))
-        })
+        schema_from_live_database(database_url.to_owned(), schema_names, table_filters)
+            .map(Self::new)
+            .map_err(LiveDatabaseCodegenError::into_error)
     }
 
     pub fn from_snapshot(path: impl AsRef<Path>) -> Result<Self> {
@@ -266,6 +265,40 @@ pub enum CodegenSource {
     SnapshotValue(SchemaSnapshot),
 }
 
+#[derive(Debug)]
+pub(crate) enum LiveDatabaseCodegenError {
+    Unreachable(String),
+    Fatal(Error),
+}
+
+impl LiveDatabaseCodegenError {
+    pub(crate) fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unreachable(_))
+    }
+
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::Unreachable(message) => Error::codegen(message),
+            Self::Fatal(err) => err,
+        }
+    }
+}
+
+impl fmt::Display for LiveDatabaseCodegenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreachable(message) => f.write_str(message),
+            Self::Fatal(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl From<Error> for LiveDatabaseCodegenError {
+    fn from(err: Error) -> Self {
+        Self::Fatal(err)
+    }
+}
+
 /// Generate a Rust schema module from any supported source.
 pub fn generate(opts: GenerateOptions) -> Result<String> {
     let schema = match opts.source {
@@ -273,13 +306,33 @@ pub fn generate(opts: GenerateOptions) -> Result<String> {
             database_url,
             schemas,
             tables,
-        } => SchemaSnapshot::from_database_with_options(&database_url, schemas, tables)?.schema,
+        } => schema_from_live_database(database_url, schemas, tables)
+            .map_err(LiveDatabaseCodegenError::into_error)?,
         CodegenSource::Snapshot(path) => SchemaSnapshot::from_snapshot(path)?.schema,
         CodegenSource::Prisma(path) => SchemaSnapshot::from_prisma(path)?.schema,
         CodegenSource::Schema(schema) => schema,
         CodegenSource::SnapshotValue(snapshot) => snapshot.schema,
     };
     generate_schema_module(&schema)
+}
+
+pub(crate) fn generate_live_database_source(
+    database_url: String,
+    schemas: Vec<String>,
+    tables: Vec<TableFilter>,
+) -> std::result::Result<String, LiveDatabaseCodegenError> {
+    let schema = schema_from_live_database(database_url, schemas, tables)?;
+    generate_schema_module(&schema).map_err(LiveDatabaseCodegenError::Fatal)
+}
+
+fn schema_from_live_database(
+    database_url: String,
+    schemas: Vec<String>,
+    tables: Vec<TableFilter>,
+) -> std::result::Result<DatabaseSchema, LiveDatabaseCodegenError> {
+    block_on_codegen_result(async move {
+        introspect_database_url_read_only_classified(&database_url, &schemas, &tables).await
+    })
 }
 
 /// A table selector accepted by `fuwa-codegen --table`.
@@ -463,16 +516,16 @@ pub async fn ensure_read_only_connection(client: &impl GenericClient) -> Result<
     }
 }
 
-async fn introspect_database_url_read_only(
+async fn introspect_database_url_read_only_classified(
     database_url: &str,
     schema_names: &[String],
     table_filters: &[TableFilter],
-) -> Result<DatabaseSchema> {
+) -> std::result::Result<DatabaseSchema, LiveDatabaseCodegenError> {
     let config = read_only_connection_config(database_url)?;
     let (client, connection) = config
         .connect(NoTls)
         .await
-        .map_err(|err| Error::codegen(err.to_string()))?;
+        .map_err(classify_live_database_connect_error)?;
 
     tokio::spawn(async move {
         if let Err(err) = connection.await {
@@ -480,24 +533,50 @@ async fn introspect_database_url_read_only(
         }
     });
 
-    ensure_read_only_connection(&client).await?;
-    introspect_schemas_read_only(&client, schema_names, table_filters).await
+    ensure_read_only_connection(&client)
+        .await
+        .map_err(LiveDatabaseCodegenError::Fatal)?;
+    introspect_schemas_read_only(&client, schema_names, table_filters)
+        .await
+        .map_err(LiveDatabaseCodegenError::Fatal)
 }
 
-fn block_on_codegen<F, T>(future: F) -> Result<T>
+fn classify_live_database_connect_error(err: tokio_postgres::Error) -> LiveDatabaseCodegenError {
+    let message = postgres_error_message(&err);
+    match err.to_string().as_str() {
+        "error connecting to server" | "timeout waiting for server" => {
+            LiveDatabaseCodegenError::Unreachable(message)
+        }
+        _ => LiveDatabaseCodegenError::Fatal(Error::codegen(message)),
+    }
+}
+
+fn postgres_error_message(err: &tokio_postgres::Error) -> String {
+    match err.source() {
+        Some(source) => format!("{err}: {source}"),
+        None => err.to_string(),
+    }
+}
+
+fn block_on_codegen_result<F, T, E>(future: F) -> std::result::Result<T, E>
 where
-    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    F: std::future::Future<Output = std::result::Result<T, E>> + Send + 'static,
     T: Send + 'static,
+    E: From<Error> + Send + 'static,
 {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|err| Error::codegen(format!("failed to start codegen runtime: {err}")))?;
+            .map_err(|err| {
+                E::from(Error::codegen(format!(
+                    "failed to start codegen runtime: {err}"
+                )))
+            })?;
         runtime.block_on(future)
     })
     .join()
-    .map_err(|_| Error::codegen("codegen runtime thread panicked"))?
+    .map_err(|_| E::from(Error::codegen("codegen runtime thread panicked")))?
 }
 
 /// Introspect a PostgreSQL schema using `pg_catalog`.
@@ -714,12 +793,13 @@ pub fn map_pg_type_with_kind(pg_type: &str, pg_type_kind: &str) -> Result<RustTy
         "numeric" => "fuwa::types::Decimal",
         "bool" => "bool",
         "bytea" => "Vec<u8>",
-        "text" | "varchar" | "bpchar" => "String",
+        "text" | "varchar" | "bpchar" | "citext" | "name" => "String",
         "uuid" => "fuwa::types::Uuid",
         "timestamp" => "fuwa::types::NaiveDateTime",
         "timestamptz" => "fuwa::types::DateTime<fuwa::types::Utc>",
         "date" => "fuwa::types::NaiveDate",
         "json" | "jsonb" => "fuwa::types::Value",
+        "oid" => "u32",
         "_int2" => "Vec<i16>",
         "_int4" => "Vec<i32>",
         "_int8" => "Vec<i64>",
@@ -727,12 +807,14 @@ pub fn map_pg_type_with_kind(pg_type: &str, pg_type_kind: &str) -> Result<RustTy
         "_float8" => "Vec<f64>",
         "_numeric" => "Vec<fuwa::types::Decimal>",
         "_bool" => "Vec<bool>",
-        "_text" | "_varchar" | "_bpchar" => "Vec<String>",
+        "_text" | "_varchar" | "_bpchar" | "_citext" | "_name" => "Vec<String>",
         "_uuid" => "Vec<fuwa::types::Uuid>",
         "_timestamp" => "Vec<fuwa::types::NaiveDateTime>",
         "_timestamptz" => "Vec<fuwa::types::DateTime<fuwa::types::Utc>>",
         "_date" => "Vec<fuwa::types::NaiveDate>",
         "_json" | "_jsonb" => "Vec<fuwa::types::Value>",
+        "_oid" => "Vec<u32>",
+        "_bytea" => "Vec<Vec<u8>>",
         other => return Err(Error::unsupported_postgres_type(other)),
     };
 
@@ -882,8 +964,10 @@ fn render_table_module(source: &mut String, table: &TableDef) {
         } else {
             "NotNull"
         });
-        source.push_str("> = Field::new(table, ");
+        source.push_str("> = Field::new_with_pg_type(table, ");
         source.push_str(&rust_string(&column.name));
+        source.push_str(", ");
+        source.push_str(&rust_string(&column.pg_type));
         source.push_str(");\n");
     }
 
@@ -899,7 +983,24 @@ fn render_table_module(source: &mut String, table: &TableDef) {
     source.push_str("}\n\n");
 
     render_record_decoder(source, table);
+    render_record_assignments(source, table);
     render_all_function(source, table);
+    source.push_str("}\n\n");
+}
+
+fn render_record_assignments(source: &mut String, table: &TableDef) {
+    source.push_str("impl fuwa::Assignments for Record {\n");
+    source.push_str("fn into_assignments(self) -> Vec<fuwa::Assignment> {\n");
+    source.push_str("vec![\n");
+    for column in &table.columns {
+        let ident = rust_ident(&column.name);
+        source.push_str(&ident);
+        source.push_str(".set(self.");
+        source.push_str(&ident);
+        source.push_str("),\n");
+    }
+    source.push_str("]\n");
+    source.push_str("}\n");
     source.push_str("}\n\n");
 }
 
@@ -1226,6 +1327,7 @@ mod tests {
         assert!(generated.contains("// @generated by fuwa-codegen"));
         assert!(generated.contains("pub mod recent_image_pair"));
         assert!(generated.contains("pub const id: Field<i64, NotNull>"));
+        assert!(generated.contains(r#"Field::new_with_pg_type(table, "id", "int8")"#));
         assert!(generated.contains("pub const user_id: Field<String, Nullable>"));
         assert!(generated.contains("pub const recent_images: Field<Vec<String>, NotNull>"));
         assert!(generated.contains("pub const score: Field<fuwa::types::Decimal, NotNull>"));
