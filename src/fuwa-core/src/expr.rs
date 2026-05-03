@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Not, Sub};
 
@@ -10,15 +11,32 @@ use crate::{
 };
 
 /// Reference to a field in the AST.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct FieldRef {
     pub(crate) table: Table,
     pub(crate) name: &'static str,
+    pub(crate) select_cast_type: Option<&'static str>,
 }
 
 impl FieldRef {
     pub(crate) const fn new(table: Table, name: &'static str) -> Self {
-        Self { table, name }
+        Self {
+            table,
+            name,
+            select_cast_type: None,
+        }
+    }
+
+    pub(crate) const fn new_with_select_cast(
+        table: Table,
+        name: &'static str,
+        select_cast_type: Option<&'static str>,
+    ) -> Self {
+        Self {
+            table,
+            name,
+            select_cast_type,
+        }
     }
 
     pub const fn table(self) -> Table {
@@ -27,6 +45,25 @@ impl FieldRef {
 
     pub const fn name(self) -> &'static str {
         self.name
+    }
+
+    pub const fn select_cast_type(self) -> Option<&'static str> {
+        self.select_cast_type
+    }
+}
+
+impl PartialEq for FieldRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.table == other.table && self.name == other.name
+    }
+}
+
+impl Eq for FieldRef {}
+
+impl Hash for FieldRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.table.hash(state);
+        self.name.hash(state);
     }
 }
 
@@ -419,11 +456,18 @@ impl<T, N> Expr<T, N> {
         self.compare(BinaryOp::Lt, rhs)
     }
 
-    pub fn lte<R>(self, rhs: R) -> Condition
+    pub fn le<R>(self, rhs: R) -> Condition
     where
         R: IntoExpr<T>,
     {
         self.compare(BinaryOp::Lte, rhs)
+    }
+
+    pub fn lte<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<T>,
+    {
+        self.le(rhs)
     }
 
     pub fn gt<R>(self, rhs: R) -> Condition
@@ -433,11 +477,18 @@ impl<T, N> Expr<T, N> {
         self.compare(BinaryOp::Gt, rhs)
     }
 
-    pub fn gte<R>(self, rhs: R) -> Condition
+    pub fn ge<R>(self, rhs: R) -> Condition
     where
         R: IntoExpr<T>,
     {
         self.compare(BinaryOp::Gte, rhs)
+    }
+
+    pub fn gte<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<T>,
+    {
+        self.ge(rhs)
     }
 
     pub fn in_<I>(self, operand: I) -> Condition
@@ -789,7 +840,11 @@ impl<N> Expr<String, N> {
 
 impl<T, N> Field<T, N> {
     pub fn expr(self) -> Expr<T, N> {
-        Expr::from_node(ExprNode::Field(FieldRef::new(self.table(), self.name())))
+        Expr::from_node(ExprNode::Field(FieldRef::new_with_select_cast(
+            self.table(),
+            self.name(),
+            self.select_cast_type(),
+        )))
     }
 
     pub fn eq<R>(self, rhs: R) -> Condition
@@ -813,11 +868,18 @@ impl<T, N> Field<T, N> {
         self.expr().lt(rhs)
     }
 
+    pub fn le<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<T>,
+    {
+        self.expr().le(rhs)
+    }
+
     pub fn lte<R>(self, rhs: R) -> Condition
     where
         R: IntoExpr<T>,
     {
-        self.expr().lte(rhs)
+        self.le(rhs)
     }
 
     pub fn gt<R>(self, rhs: R) -> Condition
@@ -827,11 +889,18 @@ impl<T, N> Field<T, N> {
         self.expr().gt(rhs)
     }
 
+    pub fn ge<R>(self, rhs: R) -> Condition
+    where
+        R: IntoExpr<T>,
+    {
+        self.expr().ge(rhs)
+    }
+
     pub fn gte<R>(self, rhs: R) -> Condition
     where
         R: IntoExpr<T>,
     {
-        self.expr().gte(rhs)
+        self.ge(rhs)
     }
 
     pub fn in_<I>(self, operand: I) -> Condition

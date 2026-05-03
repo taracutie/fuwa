@@ -50,11 +50,12 @@ pub use fuwa_core::{
 };
 pub use fuwa_derive::{FromRow, Insertable, Patch};
 pub use fuwa_postgres::{
-    create_pool, create_pool_with_options, AttachedDeleteQuery, AttachedInsertConflictBuilder,
-    AttachedInsertQuery, AttachedRawQuery, AttachedSelectQuery, AttachedUpdateQuery,
-    AttachedWithBuilder, CopyInColumn, CopyInColumns, CopyInRow, CopyInWriter, Dsl, DslContext,
-    Executor, FromRow, PgFuture, PgStream, PgType, Pool, PoolOptions, Row, StreamExt,
-    TransactionFuture, TransactionalExecutor,
+    create_pool, create_pool_with_options, deadpool_postgres, decode_field, AttachedDeleteQuery,
+    AttachedInsertConflictBuilder, AttachedInsertQuery, AttachedRawQuery, AttachedSelectQuery,
+    AttachedUpdateQuery, AttachedWithBuilder, Client, CopyInColumn, CopyInColumns, CopyInRow,
+    CopyInWriter, Dsl, DslConnection, DslContext, DslTransaction, Executor, FromRow, PgFuture,
+    PgStream, PgType, Pool, PoolOptions, Row, StreamExt, Transaction, TransactionFuture,
+    TransactionalExecutor,
 };
 pub use fuwa_query_macro::query;
 
@@ -69,11 +70,12 @@ pub mod types {
 /// PostgreSQL-specific execution exports.
 pub mod postgres {
     pub use fuwa_postgres::{
-        create_pool, create_pool_with_options, types, AttachedDeleteQuery,
-        AttachedInsertConflictBuilder, AttachedInsertQuery, AttachedRawQuery, AttachedSelectQuery,
-        AttachedUpdateQuery, AttachedWithBuilder, CopyInColumn, CopyInColumns, CopyInRow,
-        CopyInWriter, Dsl, DslContext, Executor, FromRow, PgFuture, PgStream, PgType, Pool,
-        PoolOptions, Row, StreamExt, TransactionFuture, TransactionalExecutor,
+        create_pool, create_pool_with_options, deadpool_postgres, decode_field, types,
+        AttachedDeleteQuery, AttachedInsertConflictBuilder, AttachedInsertQuery, AttachedRawQuery,
+        AttachedSelectQuery, AttachedUpdateQuery, AttachedWithBuilder, Client, CopyInColumn,
+        CopyInColumns, CopyInRow, CopyInWriter, Dsl, DslConnection, DslContext, DslTransaction,
+        Executor, FromRow, PgFuture, PgStream, PgType, Pool, PoolOptions, Row, StreamExt,
+        Transaction, TransactionFuture, TransactionalExecutor,
     };
 }
 

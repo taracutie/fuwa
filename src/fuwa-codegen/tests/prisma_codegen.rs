@@ -127,6 +127,7 @@ fn prisma_schema_generates_compile_checked_module_and_expected_sql() -> TestResu
     );
     assert!(generated.contains("pub const first_name: Field<String, NotNull>"));
     assert!(generated.contains("pub const role: Field<super::Role, Nullable>"));
+    assert!(!generated.contains(r#"new_with_pg_type_and_select_cast(table, "role""#));
     assert!(generated.contains("pub role: Option<super::Role>"));
     assert!(generated.contains("pub const state: Field<super::Table, Nullable>"));
     assert!(generated.contains("pub state: Option<super::Table>"));

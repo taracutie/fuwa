@@ -964,10 +964,20 @@ fn render_table_module(source: &mut String, table: &TableDef) {
         } else {
             "NotNull"
         });
-        source.push_str("> = Field::new_with_pg_type(table, ");
-        source.push_str(&rust_string(&column.name));
-        source.push_str(", ");
-        source.push_str(&rust_string(&column.pg_type));
+        source.push_str("> = Field::");
+        if let Some(select_cast_type) = column_select_cast_type(column) {
+            source.push_str("new_with_pg_type_and_select_cast(table, ");
+            source.push_str(&rust_string(&column.name));
+            source.push_str(", ");
+            source.push_str(&rust_string(&column.pg_type));
+            source.push_str(", ");
+            source.push_str(&rust_string(select_cast_type));
+        } else {
+            source.push_str("new_with_pg_type(table, ");
+            source.push_str(&rust_string(&column.name));
+            source.push_str(", ");
+            source.push_str(&rust_string(&column.pg_type));
+        }
         source.push_str(");\n");
     }
 
@@ -1066,6 +1076,17 @@ fn table_module_type_path(rust_type: &RustType) -> String {
         format!("super::{}", rust_type.path())
     } else {
         rust_type.path().to_owned()
+    }
+}
+
+fn column_select_cast_type(column: &ColumnDef) -> Option<&'static str> {
+    if column.pg_type_kind == "e"
+        && !column.rust_type.is_enum()
+        && column.rust_type.path() == "String"
+    {
+        Some("text")
+    } else {
+        None
     }
 }
 
@@ -1316,6 +1337,18 @@ mod tests {
                         unique: false,
                         relation: None,
                     },
+                    ColumnDef {
+                        name: "preference".to_owned(),
+                        ordinal_position: 6,
+                        pg_type: "preference_kind".to_owned(),
+                        pg_type_kind: "e".to_owned(),
+                        rust_type: RustType::new("String"),
+                        nullable: false,
+                        default_expression: None,
+                        primary_key: false,
+                        unique: false,
+                        relation: None,
+                    },
                 ],
             }],
             enums: Vec::new(),
@@ -1334,10 +1367,14 @@ mod tests {
         assert!(
             generated.contains("pub const adjustments: Field<Vec<fuwa::types::Decimal>, Nullable>")
         );
+        assert!(generated.contains("pub const preference: Field<String, NotNull>"));
+        assert!(generated.contains("new_with_pg_type_and_select_cast"));
+        assert!(generated.contains(r#""preference_kind""#));
         assert!(generated.contains("pub user_id: Option<String>"));
         assert!(generated.contains("pub recent_images: Vec<String>"));
         assert!(generated.contains("pub score: fuwa::types::Decimal"));
         assert!(generated.contains("pub adjustments: Option<Vec<fuwa::types::Decimal>>"));
+        assert!(generated.contains("pub preference: String"));
         assert!(generated.contains("impl fuwa::FromRow for Record"));
         assert!(generated.contains("pub struct All"));
         assert!(generated.contains("items.extend(id.into_select_items())"));
@@ -1394,6 +1431,9 @@ mod tests {
         assert!(generated.contains("pub enum Table"));
         assert!(generated.contains("_Self => \"SELF\""));
         assert!(generated.contains("pub const kind: Field<super::Table, NotNull>"));
+        assert!(generated.contains("new_with_pg_type"));
+        assert!(generated.contains(r#""widget_kind""#));
+        assert!(!generated.contains("new_with_pg_type_and_select_cast"));
         assert!(generated.contains("pub kind: super::Table"));
     }
 }

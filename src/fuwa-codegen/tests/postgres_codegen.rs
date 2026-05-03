@@ -259,6 +259,8 @@ async fn introspects_schema_with_related_tables_when_database_url_is_set() -> Te
         .contains("pub const shown_at: Field<fuwa::types::DateTime<fuwa::types::Utc>, NotNull>"));
     assert!(generated.contains("pub const recent_images: Field<Vec<String>, NotNull>"));
     assert!(generated.contains("pub const r#type: Field<String, NotNull>"));
+    assert!(generated.contains("new_with_pg_type_and_select_cast"));
+    assert!(generated.contains(r#""preference_kind""#));
     assert!(generated.contains("pub struct All"));
     assert!(generated.contains("fn into_select_items(self) -> Vec<fuwa::SelectItem>"));
 

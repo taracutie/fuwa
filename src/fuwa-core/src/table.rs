@@ -60,7 +60,12 @@ impl Table {
     /// join, use a nullable source field or create the alias field explicitly
     /// with `field::<T, Nullable>(...)`.
     pub const fn field_of<T, N>(self, source: Field<T, N>) -> Field<T, N> {
-        Field::new_with_optional_pg_type(self, source.name(), source.pg_type_name())
+        Field::new_with_metadata(
+            self,
+            source.name(),
+            source.pg_type_name(),
+            source.select_cast_type(),
+        )
     }
 
     /// Create typed fields attached to this table using another field or tuple
@@ -242,6 +247,7 @@ pub struct Field<T, N = NotNull> {
     table: Table,
     name: &'static str,
     pg_type: Option<&'static str>,
+    select_cast_type: Option<&'static str>,
     marker: PhantomData<fn() -> (T, N)>,
 }
 
@@ -279,15 +285,36 @@ impl<T, N> Field<T, N> {
         Self::new_with_optional_pg_type(table, name, Some(pg_type))
     }
 
+    /// Create a typed field with PostgreSQL column type metadata and a SQL
+    /// projection cast used when selecting the field directly.
+    pub const fn new_with_pg_type_and_select_cast(
+        table: Table,
+        name: &'static str,
+        pg_type: &'static str,
+        select_cast_type: &'static str,
+    ) -> Self {
+        Self::new_with_metadata(table, name, Some(pg_type), Some(select_cast_type))
+    }
+
     pub(crate) const fn new_with_optional_pg_type(
         table: Table,
         name: &'static str,
         pg_type: Option<&'static str>,
     ) -> Self {
+        Self::new_with_metadata(table, name, pg_type, None)
+    }
+
+    pub(crate) const fn new_with_metadata(
+        table: Table,
+        name: &'static str,
+        pg_type: Option<&'static str>,
+        select_cast_type: Option<&'static str>,
+    ) -> Self {
         Self {
             table,
             name,
             pg_type,
+            select_cast_type,
             marker: PhantomData,
         }
     }
@@ -302,6 +329,10 @@ impl<T, N> Field<T, N> {
 
     pub const fn pg_type_name(self) -> Option<&'static str> {
         self.pg_type
+    }
+
+    pub const fn select_cast_type(self) -> Option<&'static str> {
+        self.select_cast_type
     }
 }
 

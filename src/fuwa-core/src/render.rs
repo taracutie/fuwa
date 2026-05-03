@@ -102,7 +102,7 @@ impl Renderer {
 impl<R, S> RenderQuery for SelectQuery<R, S> {
     fn render(self) -> Result<RenderedQuery> {
         let mut renderer = Renderer::default();
-        render_select(self, &mut renderer)?;
+        render_select(self, &mut renderer, ProjectionCastMode::ClientDecoded)?;
         Ok(renderer.finish())
     }
 }
@@ -131,7 +131,11 @@ impl<R> RenderQuery for DeleteQuery<R> {
     }
 }
 
-fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Result<()> {
+fn render_select<R, S>(
+    query: SelectQuery<R, S>,
+    renderer: &mut Renderer,
+    projection_cast_mode: ProjectionCastMode,
+) -> Result<()> {
     if query.selection.is_empty() {
         return Err(Error::invalid_query_shape(
             "SELECT requires at least one item",
@@ -149,7 +153,7 @@ fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Res
             }
             renderer.sql.push_str(&quote_ident(cte.name)?);
             renderer.sql.push_str(" as (");
-            render_select(cte.query, renderer)?;
+            render_select(cte.query, renderer, ProjectionCastMode::Data)?;
             renderer.sql.push(')');
         }
         renderer.sql.push(' ');
@@ -165,11 +169,22 @@ fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Res
         None
     };
 
+    let order_projection_cast_fields = collect_distinct_order_projection_cast_fields(
+        &query.selection,
+        query.distinct.as_ref(),
+        projection_cast_mode,
+    );
+
     renderer.sql.push_str("select ");
     if let Some(distinct) = query.distinct {
         render_distinct(distinct, renderer)?;
     }
-    render_select_items(query.selection, renderer, FieldQualification::Qualified)?;
+    render_select_items(
+        query.selection,
+        renderer,
+        FieldQualification::Qualified,
+        projection_cast_mode,
+    )?;
     renderer.sql.push_str(" from ");
     render_table_source(from, renderer)?;
 
@@ -210,12 +225,22 @@ fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Res
             } else {
                 FieldQualification::Qualified
             };
-            render_select_tail(set_op.left_tail, renderer, qualification)?;
+            let left_order_projection_cast_fields = if index == 0 {
+                order_projection_cast_fields.as_slice()
+            } else {
+                &[]
+            };
+            render_select_tail(
+                set_op.left_tail,
+                renderer,
+                qualification,
+                left_order_projection_cast_fields,
+            )?;
             renderer.sql.push(')');
             renderer.sql.push(' ');
             renderer.sql.push_str(set_op_keyword(set_op.op, set_op.all));
             renderer.sql.push_str(" (");
-            render_select(set_op.query, renderer)?;
+            render_select(set_op.query, renderer, projection_cast_mode)?;
             renderer.sql.push(')');
         }
     }
@@ -224,6 +249,11 @@ fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Res
         FieldQualification::Unqualified
     } else {
         FieldQualification::Qualified
+    };
+    let tail_order_projection_cast_fields = if has_set_ops {
+        &[]
+    } else {
+        order_projection_cast_fields.as_slice()
     };
     render_select_tail(
         SelectTail {
@@ -234,6 +264,7 @@ fn render_select<R, S>(query: SelectQuery<R, S>, renderer: &mut Renderer) -> Res
         },
         renderer,
         qualification,
+        tail_order_projection_cast_fields,
     )?;
 
     Ok(())
@@ -243,10 +274,16 @@ fn render_select_tail(
     tail: SelectTail,
     renderer: &mut Renderer,
     qualification: FieldQualification,
+    order_projection_cast_fields: &[FieldRef],
 ) -> Result<()> {
     if !tail.order_by.is_empty() {
         renderer.sql.push_str(" order by ");
-        render_order_by_with_qualification(tail.order_by, renderer, qualification)?;
+        render_order_by_with_qualification(
+            tail.order_by,
+            renderer,
+            qualification,
+            order_projection_cast_fields,
+        )?;
     }
 
     if let Some(limit) = tail.limit {
@@ -375,7 +412,7 @@ fn render_insert<R>(query: InsertQuery<R>, renderer: &mut Renderer) -> Result<()
             renderer.sql.push_str(&quote_ident(column.name())?);
         }
         renderer.sql.push_str(") ");
-        render_select(select_source, renderer)?;
+        render_select(select_source, renderer, ProjectionCastMode::Data)?;
 
         if let Some(on_conflict) = query.on_conflict {
             render_insert_conflict(query.table, on_conflict, renderer)?;
@@ -383,7 +420,12 @@ fn render_insert<R>(query: InsertQuery<R>, renderer: &mut Renderer) -> Result<()
 
         if !query.returning.is_empty() {
             renderer.sql.push_str(" returning ");
-            render_select_items(query.returning, renderer, FieldQualification::Unqualified)?;
+            render_select_items(
+                query.returning,
+                renderer,
+                FieldQualification::Unqualified,
+                ProjectionCastMode::ClientDecoded,
+            )?;
         }
 
         return Ok(());
@@ -429,7 +471,12 @@ fn render_insert<R>(query: InsertQuery<R>, renderer: &mut Renderer) -> Result<()
 
     if !query.returning.is_empty() {
         renderer.sql.push_str(" returning ");
-        render_select_items(query.returning, renderer, FieldQualification::Unqualified)?;
+        render_select_items(
+            query.returning,
+            renderer,
+            FieldQualification::Unqualified,
+            ProjectionCastMode::ClientDecoded,
+        )?;
     }
 
     Ok(())
@@ -548,7 +595,12 @@ fn render_update<R>(query: UpdateQuery<R>, renderer: &mut Renderer) -> Result<()
 
     if !query.returning.is_empty() {
         renderer.sql.push_str(" returning ");
-        render_select_items(query.returning, renderer, returning_qualification)?;
+        render_select_items(
+            query.returning,
+            renderer,
+            returning_qualification,
+            ProjectionCastMode::ClientDecoded,
+        )?;
     }
 
     Ok(())
@@ -580,7 +632,12 @@ fn render_delete<R>(query: DeleteQuery<R>, renderer: &mut Renderer) -> Result<()
 
     if !query.returning.is_empty() {
         renderer.sql.push_str(" returning ");
-        render_select_items(query.returning, renderer, returning_qualification)?;
+        render_select_items(
+            query.returning,
+            renderer,
+            returning_qualification,
+            ProjectionCastMode::ClientDecoded,
+        )?;
     }
 
     Ok(())
@@ -637,16 +694,44 @@ fn validate_insert_rows(table: Table, rows: &[Vec<Assignment>]) -> Result<()> {
     Ok(())
 }
 
+fn collect_distinct_order_projection_cast_fields(
+    selection: &[SelectItem],
+    distinct: Option<&SelectDistinct>,
+    projection_cast_mode: ProjectionCastMode,
+) -> Vec<FieldRef> {
+    if !matches!(projection_cast_mode, ProjectionCastMode::ClientDecoded)
+        || !matches!(distinct, Some(SelectDistinct::Distinct))
+    {
+        return Vec::new();
+    }
+
+    selection
+        .iter()
+        .filter_map(|item| match &item.expr {
+            ExprNode::Field(field) if field.select_cast_type().is_some() => Some(*field),
+            _ => None,
+        })
+        .collect()
+}
+
 fn render_select_items(
     items: Vec<SelectItem>,
     renderer: &mut Renderer,
     qualification: FieldQualification,
+    projection_cast_mode: ProjectionCastMode,
 ) -> Result<()> {
     for (index, item) in items.into_iter().enumerate() {
         if index > 0 {
             renderer.sql.push_str(", ");
         }
-        render_expr(item.expr, renderer, qualification)?;
+        match (projection_cast_mode, item.expr) {
+            (ProjectionCastMode::ClientDecoded, ExprNode::Field(field))
+                if field.select_cast_type().is_some() =>
+            {
+                render_field_select_cast(field, renderer, qualification)?;
+            }
+            (_, expr) => render_expr(expr, renderer, qualification)?,
+        }
         if let Some(alias) = item.alias {
             renderer.sql.push_str(" as ");
             renderer.sql.push_str(&quote_ident(alias)?);
@@ -693,18 +778,72 @@ fn render_order_by_with_qualification(
     order_by: Vec<OrderExpr>,
     renderer: &mut Renderer,
     qualification: FieldQualification,
+    order_projection_cast_fields: &[FieldRef],
 ) -> Result<()> {
     for (index, order) in order_by.into_iter().enumerate() {
         if index > 0 {
             renderer.sql.push_str(", ");
         }
-        render_expr(order.expr, renderer, qualification)?;
+        render_order_expr(
+            order.expr,
+            renderer,
+            qualification,
+            order_projection_cast_fields,
+        )?;
         renderer.sql.push(' ');
         renderer.sql.push_str(match order.direction {
             OrderDirection::Asc => "asc",
             OrderDirection::Desc => "desc",
         });
     }
+    Ok(())
+}
+
+fn render_order_expr(
+    expr: ExprNode,
+    renderer: &mut Renderer,
+    qualification: FieldQualification,
+    order_projection_cast_fields: &[FieldRef],
+) -> Result<()> {
+    match expr {
+        ExprNode::Field(field) => {
+            if let Some(select_cast_type) = order_projection_cast_fields
+                .iter()
+                .find(|selected| **selected == field)
+                .and_then(|selected| selected.select_cast_type())
+            {
+                render_field_cast(field, select_cast_type, renderer, qualification)
+            } else {
+                render_expr(ExprNode::Field(field), renderer, qualification)
+            }
+        }
+        expr => render_expr(expr, renderer, qualification),
+    }
+}
+
+fn render_field_select_cast(
+    field: FieldRef,
+    renderer: &mut Renderer,
+    qualification: FieldQualification,
+) -> Result<()> {
+    let Some(select_cast_type) = field.select_cast_type() else {
+        return render_expr(ExprNode::Field(field), renderer, qualification);
+    };
+
+    render_field_cast(field, select_cast_type, renderer, qualification)
+}
+
+fn render_field_cast(
+    field: FieldRef,
+    select_cast_type: &str,
+    renderer: &mut Renderer,
+    qualification: FieldQualification,
+) -> Result<()> {
+    renderer.sql.push_str("cast(");
+    render_expr(ExprNode::Field(field), renderer, qualification)?;
+    renderer.sql.push_str(" as ");
+    renderer.sql.push_str(select_cast_type);
+    renderer.sql.push(')');
     Ok(())
 }
 
@@ -728,7 +867,7 @@ fn render_table_source(source: TableSourceRef, renderer: &mut Renderer) -> Resul
         TableSourceKind::Table(table) => render_table(table, renderer),
         TableSourceKind::Subquery(subquery) => {
             renderer.sql.push('(');
-            render_select(*subquery.query, renderer)?;
+            render_select(*subquery.query, renderer, ProjectionCastMode::Data)?;
             renderer.sql.push_str(") as ");
             renderer.sql.push_str(&quote_ident(subquery.alias)?);
             Ok(())
@@ -740,6 +879,12 @@ fn render_table_source(source: TableSourceRef, renderer: &mut Renderer) -> Resul
 enum FieldQualification {
     Qualified,
     Unqualified,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProjectionCastMode {
+    ClientDecoded,
+    Data,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -900,7 +1045,7 @@ fn render_expr_with_context(
                     } else {
                         renderer.sql.push_str(" in (");
                     }
-                    render_select(*query, renderer)?;
+                    render_select(*query, renderer, ProjectionCastMode::Data)?;
                     renderer.sql.push_str("))");
                 }
             }
@@ -1004,7 +1149,7 @@ fn render_expr_with_context(
             } else {
                 renderer.sql.push_str("exists (");
             }
-            render_select(*query, renderer)?;
+            render_select(*query, renderer, ProjectionCastMode::Data)?;
             renderer.sql.push(')');
             Ok(())
         }
@@ -1191,6 +1336,15 @@ mod tests {
         pub const profile: Field<serde_json::Value, Nullable> = Field::new(table, "profile");
         pub const tags: Field<Vec<String>, NotNull> = Field::new(table, "tags");
         pub const oid_history: Field<Vec<u32>, NotNull> = Field::new(table, "oid_history");
+        pub const status: Field<String, NotNull> =
+            Field::new_with_pg_type_and_select_cast(table, "status", "user_status", "text");
+        pub const optional_status: Field<String, Nullable> =
+            Field::new_with_pg_type_and_select_cast(
+                table,
+                "optional_status",
+                "user_status",
+                "text",
+            );
     }
 
     #[allow(non_upper_case_globals)]
@@ -1251,6 +1405,51 @@ mod tests {
     }
 
     #[test]
+    fn renders_projection_cast_for_enum_string_fields() {
+        let query = Context::new()
+            .select((
+                users::status,
+                users::status.as_("state"),
+                nullable(users::optional_status),
+            ))
+            .from(users::table)
+            .where_(users::status.eq(bind("active")))
+            .order_by(users::status.asc())
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select cast("users"."status" as text), "#,
+                r#"cast("users"."status" as text) as "state", "#,
+                r#"cast("users"."optional_status" as text) from "public"."users" "#,
+                r#"where ("users"."status" = $1) order by "users"."status" asc"#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn renders_projection_cast_for_enum_string_returning_fields() {
+        let query = Context::new()
+            .insert_into(users::table)
+            .values(users::status.set(bind("active")))
+            .returning(users::status)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"insert into "public"."users" ("status") values ($1) "#,
+                r#"returning cast("status" as text)"#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
     fn renders_sixteen_column_select() {
         let query = Context::new()
             .select((
@@ -1300,6 +1499,25 @@ mod tests {
         assert_eq!(
             query.sql(),
             r#"select distinct "users"."email" from "public"."users""#
+        );
+    }
+
+    #[test]
+    fn renders_distinct_enum_string_order_by_with_projection_cast() {
+        let query = Context::new()
+            .select(users::status)
+            .distinct()
+            .from(users::table)
+            .order_by(users::status.asc())
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select distinct cast("users"."status" as text) "#,
+                r#"from "public"."users" order by cast("users"."status" as text) asc"#
+            )
         );
     }
 
@@ -1615,6 +1833,29 @@ mod tests {
             )
         );
         assert_eq!(query.binds().len(), 2);
+    }
+
+    #[test]
+    fn aliased_subquery_field_of_accepts_casted_enum_string_field() {
+        let subquery = Context::new()
+            .select(users::status)
+            .from(users::table)
+            .alias("u");
+        let projected_status = subquery.field_of(users::status);
+
+        let query = Context::new()
+            .select(projected_status)
+            .from(subquery)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"select cast("u"."status" as text) from "#,
+                r#"(select "users"."status" from "public"."users") as "u""#
+            )
+        );
     }
 
     #[test]
@@ -2739,6 +2980,33 @@ mod tests {
     }
 
     #[test]
+    fn set_operation_left_distinct_enum_order_by_uses_projection_cast() {
+        let q1 = Context::new()
+            .select(users::status)
+            .distinct()
+            .from(users::table)
+            .order_by(users::status.asc());
+        let q2 = Context::new().select(users::status).from(users::table);
+
+        let query = q1
+            .union(q2)
+            .order_by(users::status.desc())
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"(select distinct cast("users"."status" as text) "#,
+                r#"from "public"."users" "#,
+                r#"order by cast("users"."status" as text) asc) union "#,
+                r#"(select cast("users"."status" as text) from "public"."users") "#,
+                r#"order by "status" desc"#
+            )
+        );
+    }
+
+    #[test]
     fn renders_mixed_set_operations_left_associative() {
         let q1 = Context::new()
             .select(users::id)
@@ -2891,6 +3159,32 @@ mod tests {
                 r#"insert into "public"."users" ("id", "email") "#,
                 r#"select "users"."id", "users"."email" from "public"."users" "#,
                 r#"where ("users"."active" = $1) returning "id""#
+            )
+        );
+        assert_eq!(query.binds().len(), 1);
+    }
+
+    #[test]
+    fn insert_select_preserves_enum_field_type_in_source_projection() {
+        let source = Context::new()
+            .select(users::status)
+            .from(users::table)
+            .where_(users::active.eq(bind(true)));
+
+        let query = Context::new()
+            .insert_into(users::table)
+            .columns((users::status,))
+            .from_select(source)
+            .returning(users::status)
+            .render()
+            .unwrap();
+
+        assert_eq!(
+            query.sql(),
+            concat!(
+                r#"insert into "public"."users" ("status") "#,
+                r#"select "users"."status" from "public"."users" "#,
+                r#"where ("users"."active" = $1) returning cast("status" as text)"#
             )
         );
         assert_eq!(query.binds().len(), 1);

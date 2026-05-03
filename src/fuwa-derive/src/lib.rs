@@ -100,14 +100,20 @@ fn field_decoder(field: &Field, container: &ContainerAttrs) -> syn::Result<Token
         None => container.apply_rename_all(&raw_name),
     };
 
-    let decode = quote! {
-        row.try_get::<_, #ty>(#column_name).map_err(|err| {
-            ::fuwa::Error::row_decode(format!(
-                "failed to decode column {}: {}",
-                #column_name,
-                err
-            ))
-        })?
+    let decode = if let Some(decode_path) = attrs.decode_with.as_ref() {
+        quote! {
+            #decode_path(row, #column_name)?
+        }
+    } else {
+        quote! {
+            row.try_get::<_, #ty>(#column_name).map_err(|err| {
+                ::fuwa::Error::row_decode(format!(
+                    "failed to decode column {}: {}",
+                    #column_name,
+                    err
+                ))
+            })?
+        }
     };
 
     if attrs.default {
@@ -311,6 +317,7 @@ struct FieldAttrs {
     skip: bool,
     default: bool,
     flatten: bool,
+    decode_with: Option<Path>,
 }
 
 impl FieldAttrs {
@@ -331,22 +338,28 @@ impl FieldAttrs {
                     out.default = true;
                 } else if meta.path.is_ident("flatten") {
                     out.flatten = true;
+                } else if meta.path.is_ident("decode_with") {
+                    let lit: LitStr = meta.value()?.parse()?;
+                    let path: Path = lit.parse()?;
+                    out.decode_with = Some(path);
                 } else {
                     return Err(meta.error(
-                        "unknown fuwa field attribute; supported: rename, skip, default, flatten",
+                        "unknown fuwa field attribute; supported: rename, skip, default, flatten, decode_with",
                     ));
                 }
                 Ok(())
             })?;
         }
         if let Some(span_attr) = first_fuwa {
-            if out.flatten && (out.rename.is_some() || out.default) {
+            if out.flatten && (out.rename.is_some() || out.default || out.decode_with.is_some()) {
                 return Err(syn::Error::new_spanned(
                     span_attr,
-                    "fuwa(flatten) cannot combine with rename or default",
+                    "fuwa(flatten) cannot combine with rename, default, or decode_with",
                 ));
             }
-            if out.skip && (out.rename.is_some() || out.default || out.flatten) {
+            if out.skip
+                && (out.rename.is_some() || out.default || out.flatten || out.decode_with.is_some())
+            {
                 return Err(syn::Error::new_spanned(
                     span_attr,
                     "fuwa(skip) cannot combine with other fuwa attrs",

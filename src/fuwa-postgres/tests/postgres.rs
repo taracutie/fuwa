@@ -38,6 +38,64 @@ fn pool_options_reject_zero_max_size() {
 }
 
 #[tokio::test]
+async fn enum_string_field_selects_with_text_cast_when_database_url_is_set() -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!(
+            "skipping enum string projection integration test: FUWA_TEST_DATABASE_URL is not set"
+        );
+        return Ok(());
+    };
+
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("PostgreSQL connection task failed: {err}");
+        }
+    });
+
+    client
+        .batch_execute(
+            r#"
+            drop schema if exists fuwa_enum_decode cascade;
+            create schema fuwa_enum_decode;
+            create type fuwa_enum_decode.preference_kind as enum ('MORE', 'LESS');
+            create table fuwa_enum_decode.preferences (
+                id bigint primary key,
+                kind fuwa_enum_decode.preference_kind not null
+            );
+            insert into fuwa_enum_decode.preferences (id, kind) values (1, 'MORE');
+            "#,
+        )
+        .await?;
+
+    #[allow(non_upper_case_globals)]
+    mod preferences {
+        use fuwa_core::prelude::*;
+
+        pub const table: Table = Table::new("fuwa_enum_decode", "preferences");
+        pub const id: Field<i64, NotNull> = Field::new(table, "id");
+        pub const kind: Field<String, NotNull> =
+            Field::new_with_pg_type_and_select_cast(table, "kind", "preference_kind", "text");
+    }
+
+    let dsl = Dsl::using(&client);
+    let kind = dsl
+        .select(preferences::kind)
+        .from(preferences::table)
+        .where_(preferences::id.eq(bind(1_i64)))
+        .fetch_one()
+        .await?;
+
+    assert_eq!(kind, "MORE");
+
+    client
+        .batch_execute("drop schema if exists fuwa_enum_decode cascade;")
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn notify_none_sends_empty_payload_when_database_url_is_set() -> TestResult {
     let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
         eprintln!("skipping NOTIFY integration test: FUWA_TEST_DATABASE_URL is not set");
@@ -138,6 +196,16 @@ mod pool_users {
     use fuwa_core::prelude::*;
 
     pub const table: Table = Table::new("public", "fuwa_test_pool_users");
+    pub const id: Field<i64, NotNull> = Field::new(table, "id");
+    pub const email: Field<String, NotNull> = Field::new(table, "email");
+    pub const active: Field<bool, NotNull> = Field::new(table, "active");
+}
+
+#[allow(non_upper_case_globals)]
+mod acquire_users {
+    use fuwa_core::prelude::*;
+
+    pub const table: Table = Table::new("public", "fuwa_test_acquire_users");
     pub const id: Field<i64, NotNull> = Field::new(table, "id");
     pub const email: Field<String, NotNull> = Field::new(table, "email");
     pub const active: Field<bool, NotNull> = Field::new(table, "active");
@@ -833,6 +901,116 @@ async fn pool_transaction_callback_uses_dsl_context_when_database_url_is_set() -
 }
 
 #[tokio::test]
+async fn pool_acquire_begin_commit_round_trips_when_database_url_is_set() -> TestResult {
+    let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
+        eprintln!(
+            "skipping pool acquire+begin integration test: FUWA_TEST_DATABASE_URL is not set"
+        );
+        return Ok(());
+    };
+
+    let pool = test_pool(&database_url, 4)?;
+    {
+        let client = pool.get().await?;
+        client
+            .batch_execute(
+                r#"
+                drop table if exists public.fuwa_test_acquire_users;
+                create table public.fuwa_test_acquire_users (
+                    id bigint primary key,
+                    email text not null unique,
+                    active boolean not null
+                );
+                "#,
+            )
+            .await?;
+    }
+
+    let dsl = Dsl::using(pool.clone());
+    let mut conn = dsl.acquire().await?;
+
+    // Commit path.
+    let tx = conn.begin().await?;
+    let inserted: i64 = tx
+        .dsl()
+        .insert_into(acquire_users::table)
+        .values((
+            acquire_users::id.set(bind(1_i64)),
+            acquire_users::email.set(bind("commit@example.com")),
+            acquire_users::active.set(bind(true)),
+        ))
+        .returning(acquire_users::id)
+        .fetch_one()
+        .await?;
+    assert_eq!(inserted, 1);
+    tx.commit().await?;
+
+    let committed_count: i64 = dsl
+        .select(count_star())
+        .from(acquire_users::table)
+        .where_(acquire_users::email.eq(bind("commit@example.com")))
+        .fetch_one()
+        .await?;
+    assert_eq!(committed_count, 1);
+
+    // Explicit rollback path.
+    let tx = conn.begin().await?;
+    tx.dsl()
+        .insert_into(acquire_users::table)
+        .values((
+            acquire_users::id.set(bind(2_i64)),
+            acquire_users::email.set(bind("rollback@example.com")),
+            acquire_users::active.set(bind(true)),
+        ))
+        .execute()
+        .await?;
+    tx.rollback().await?;
+
+    let rolled_back_count: i64 = dsl
+        .select(count_star())
+        .from(acquire_users::table)
+        .where_(acquire_users::email.eq(bind("rollback@example.com")))
+        .fetch_one()
+        .await?;
+    assert_eq!(rolled_back_count, 0);
+
+    // Drop = rollback path.
+    {
+        let tx = conn.begin().await?;
+        tx.dsl()
+            .insert_into(acquire_users::table)
+            .values((
+                acquire_users::id.set(bind(3_i64)),
+                acquire_users::email.set(bind("dropped@example.com")),
+                acquire_users::active.set(bind(true)),
+            ))
+            .execute()
+            .await?;
+        // drop without commit — tokio-postgres rollbacks on drop
+    }
+
+    // Re-acquire to ensure the previous drop-rollback was actually flushed
+    // before we read.
+    drop(conn);
+    let dropped_count: i64 = dsl
+        .select(count_star())
+        .from(acquire_users::table)
+        .where_(acquire_users::email.eq(bind("dropped@example.com")))
+        .fetch_one()
+        .await?;
+    assert_eq!(dropped_count, 0);
+
+    {
+        let client = pool.get().await?;
+        client
+            .batch_execute("drop table if exists public.fuwa_test_acquire_users;")
+            .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn priority_features_round_trip_when_database_url_is_set() -> TestResult {
     let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
         eprintln!("skipping priority feature integration test: FUWA_TEST_DATABASE_URL is not set");
@@ -1040,7 +1218,7 @@ async fn priority_features_round_trip_when_database_url_is_set() -> TestResult {
         .from_select(
             dsl.select((events::id, events::account_id, events::amount))
                 .from(events::table)
-                .where_(events::amount.gte(bind(30_i32))),
+                .where_(events::amount.ge(bind(30_i32))),
         )
         .execute()
         .await?;
@@ -1411,7 +1589,7 @@ async fn complex_schema_queries_with_real_data_when_database_url_is_set() -> Tes
     let high_rank_accounts = dsl
         .select(accounts::email)
         .from(accounts::table)
-        .where_(accounts::signup_rank.gte(bind(30_i32)))
+        .where_(accounts::signup_rank.ge(bind(30_i32)))
         .order_by(accounts::signup_rank.desc())
         .fetch_all()
         .await?;

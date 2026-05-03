@@ -56,6 +56,29 @@ struct FlattenedAccount {
     active: bool,
 }
 
+#[derive(Debug, PartialEq, FromRow)]
+struct ScoredAccount {
+    id: i64,
+    // Column is `double precision` (= f64), but we want to store as f32. The
+    // base derive can't narrow types; `decode_with` is the escape hatch.
+    #[fuwa(decode_with = "decode_score_as_f32")]
+    score: f32,
+}
+
+#[derive(Debug, PartialEq, FromRow)]
+struct ScoredAccountWithDefault {
+    id: i64,
+    // `decode_with` + `default` should compose: column missing -> `Default`,
+    // column present -> custom decoder.
+    #[fuwa(default, decode_with = "decode_score_as_f32")]
+    score: f32,
+}
+
+fn decode_score_as_f32(row: &fuwa::Row, column: &str) -> fuwa::Result<f32> {
+    let value: f64 = fuwa::decode_field(row, column)?;
+    Ok(value as f32)
+}
+
 #[tokio::test]
 async fn fromrow_attrs_round_trip_when_database_url_is_set() -> TestResult {
     let Ok(database_url) = std::env::var("FUWA_TEST_DATABASE_URL") else {
@@ -169,6 +192,44 @@ async fn fromrow_attrs_round_trip_when_database_url_is_set() -> TestResult {
                 email: "f@example.com".into()
             },
             active: true
+        }
+    );
+
+    let scored = dsl
+        .raw("select 31::bigint as id, 0.5::double precision as score")
+        .fetch_one_as::<ScoredAccount>()
+        .await?;
+    assert_eq!(
+        scored,
+        ScoredAccount {
+            id: 31,
+            score: 0.5_f32
+        }
+    );
+
+    // decode_with + default: column present -> decoder runs.
+    let scored_default_present = dsl
+        .raw("select 41::bigint as id, 0.25::double precision as score")
+        .fetch_one_as::<ScoredAccountWithDefault>()
+        .await?;
+    assert_eq!(
+        scored_default_present,
+        ScoredAccountWithDefault {
+            id: 41,
+            score: 0.25_f32
+        }
+    );
+
+    // decode_with + default: column missing -> Default (0.0).
+    let scored_default_missing = dsl
+        .raw("select 42::bigint as id")
+        .fetch_one_as::<ScoredAccountWithDefault>()
+        .await?;
+    assert_eq!(
+        scored_default_missing,
+        ScoredAccountWithDefault {
+            id: 42,
+            score: 0.0_f32
         }
     );
 

@@ -36,21 +36,41 @@ fn scalar_comparators_implicitly_bind_values() {
             .eq(true)
             .and(users::ID.ne(8_i64))
             .and(users::SIGNUP_RANK.lt(9_i32))
-            .and(users::SIGNUP_RANK.lte(10_i32))
+            .and(users::SIGNUP_RANK.le(10_i32))
             .and(users::SIGNUP_RANK.gt(1_i32))
-            .and(users::SIGNUP_RANK.gte(2_i32)),
+            .and(users::SIGNUP_RANK.ge(2_i32)),
     );
     let explicit = render_where(
         users::ACTIVE
             .eq(bind(true))
             .and(users::ID.ne(bind(8_i64)))
             .and(users::SIGNUP_RANK.lt(bind(9_i32)))
-            .and(users::SIGNUP_RANK.lte(bind(10_i32)))
+            .and(users::SIGNUP_RANK.le(bind(10_i32)))
             .and(users::SIGNUP_RANK.gt(bind(1_i32)))
-            .and(users::SIGNUP_RANK.gte(bind(2_i32))),
+            .and(users::SIGNUP_RANK.ge(bind(2_i32))),
     );
 
     assert_same_rendered(implicit, explicit);
+}
+
+#[test]
+fn legacy_lte_gte_aliases_match_le_ge() {
+    assert_same_rendered(
+        render_where(users::SIGNUP_RANK.lte(10_i32)),
+        render_where(users::SIGNUP_RANK.le(10_i32)),
+    );
+    assert_same_rendered(
+        render_where(users::SIGNUP_RANK.gte(2_i32)),
+        render_where(users::SIGNUP_RANK.ge(2_i32)),
+    );
+    assert_same_rendered(
+        render_where(users::SIGNUP_RANK.expr().lte(10_i32)),
+        render_where(users::SIGNUP_RANK.expr().le(10_i32)),
+    );
+    assert_same_rendered(
+        render_where(users::SIGNUP_RANK.expr().gte(2_i32)),
+        render_where(users::SIGNUP_RANK.expr().ge(2_i32)),
+    );
 }
 
 #[test]

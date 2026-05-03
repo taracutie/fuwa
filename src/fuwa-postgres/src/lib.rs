@@ -22,10 +22,10 @@ pub use copy::{CopyInColumn, CopyInColumnMeta, CopyInColumns, CopyInRow, CopyInW
 use pg_error::map_pg_error;
 pub use tokio_postgres::types;
 use tokio_postgres::types::FromSqlOwned;
-pub use tokio_postgres::Row;
-use tokio_postgres::{Client, GenericClient, NoTls, Portal, Row as PgRow, RowStream, Transaction};
+pub use tokio_postgres::{Client, Row, Transaction};
+use tokio_postgres::{GenericClient, NoTls, Portal, Row as PgRow, RowStream};
 
-pub use deadpool_postgres::Pool;
+pub use deadpool_postgres::{self, Pool};
 pub use fuwa_core::{Error, Result};
 /// Boxed future returned by `fuwa-postgres` extension methods.
 pub type PgFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -399,6 +399,16 @@ where
         }
     }
 
+    /// Borrow the underlying executor.
+    ///
+    /// Useful as an escape hatch when you need to reach the source `Pool`,
+    /// `Client`, or `Transaction` directly ~ for example, to acquire a
+    /// connection out of a `deadpool_postgres::Pool` and start a manually
+    /// managed transaction (see the README "manual transactions" section).
+    pub fn executor(&self) -> &E {
+        &self.executor
+    }
+
     pub fn select<S>(&self, selection: S) -> AttachedSelectQuery<'_, E, S::Record, S::SingleSql>
     where
         S: Selectable,
@@ -447,7 +457,11 @@ where
         }
     }
 
-    /// Run any built query (free-function form) and decode rows.
+    /// Run any built query and decode rows into the projection's inferred row type.
+    ///
+    /// **Single-column projections decode as the bare scalar `T`, not `(T,)`.**
+    /// E.g. `select(users::id).fetch_all()` returns `Vec<i64>`, not `Vec<(i64,)>`.
+    /// To override the inferred row type, use [`fetch_all_as`](Self::fetch_all_as).
     pub fn fetch_all<'a, Q>(&'a self, query: Q) -> PgFuture<'a, Vec<Q::Row>>
     where
         Q: fuwa_core::Query + Send + 'a,
@@ -457,6 +471,10 @@ where
     }
 
     /// Run any built query and decode rows into an explicit override type.
+    ///
+    /// Same scalar-vs-tuple behavior as [`fetch_all`](Self::fetch_all): for a
+    /// single-column projection, decode as `Vec<T>` (e.g. `fetch_all_as::<String>()`),
+    /// not `Vec<(T,)>`.
     pub fn fetch_all_as<'a, Q, Row>(&'a self, query: Q) -> PgFuture<'a, Vec<Row>>
     where
         Q: RenderQuery + Send + 'a,
@@ -466,6 +484,9 @@ where
     }
 
     /// Run any built query and decode exactly one row.
+    ///
+    /// Single-column projections decode as the bare scalar `T`, not `(T,)`. See
+    /// [`fetch_all`](Self::fetch_all) for the scalar-vs-tuple convention.
     pub fn fetch_one<'a, Q>(&'a self, query: Q) -> PgFuture<'a, Q::Row>
     where
         Q: fuwa_core::Query + Send + 'a,
@@ -474,6 +495,7 @@ where
         fetch_one_query(&self.executor, query)
     }
 
+    /// Run any built query and decode exactly one row into an explicit override type.
     pub fn fetch_one_as<'a, Q, Row>(&'a self, query: Q) -> PgFuture<'a, Row>
     where
         Q: RenderQuery + Send + 'a,
@@ -483,6 +505,8 @@ where
     }
 
     /// Run any built query and decode an optional row.
+    ///
+    /// Single-column projections decode as `Option<T>`, not `Option<(T,)>`.
     pub fn fetch_optional<'a, Q>(&'a self, query: Q) -> PgFuture<'a, Option<Q::Row>>
     where
         Q: fuwa_core::Query + Send + 'a,
@@ -491,6 +515,7 @@ where
         fetch_optional_query(&self.executor, query)
     }
 
+    /// Run any built query and decode an optional row into an explicit override type.
     pub fn fetch_optional_as<'a, Q, Row>(&'a self, query: Q) -> PgFuture<'a, Option<Row>>
     where
         Q: RenderQuery + Send + 'a,
@@ -580,6 +605,11 @@ where
     for<'conn> E::Conn<'conn>: TransactionConnection,
 {
     /// Run a closure inside a PostgreSQL transaction.
+    ///
+    /// For callers that hit Rust's async-closure HRTB inference limits, the
+    /// non-closure [`DslContext::<Pool>::acquire`] +
+    /// [`DslConnection::begin`] / [`DslContext::<&mut Client>::begin`] APIs
+    /// give equivalent transactional semantics without an `AsyncFnOnce` bound.
     pub async fn transaction<F, T>(&self, f: F) -> Result<T>
     where
         F: for<'tx> AsyncFnOnce(DslContext<&'tx Transaction<'tx>>) -> Result<T>,
@@ -608,6 +638,21 @@ impl DslContext<&mut Client> {
         transaction_with_client(self.executor, f).await
     }
 
+    /// Begin a transaction without a closure.
+    ///
+    /// Returns a [`DslTransaction`] guard that you finalize with
+    /// [`DslTransaction::commit`] / [`DslTransaction::rollback`]. If the guard
+    /// is dropped without committing, the transaction is rolled back
+    /// (tokio-postgres handles this on `Transaction::drop`).
+    ///
+    /// Prefer this over [`Self::transaction`] when the closure form fights
+    /// `AsyncFnOnce` HRTB inference (e.g. inside `async_trait` methods or when
+    /// the closure body captures non-`'static` references from `&self`).
+    pub async fn begin(&mut self) -> Result<DslTransaction<'_>> {
+        let txn = self.executor.transaction().await.map_err(map_pg_error)?;
+        Ok(DslTransaction::new(txn))
+    }
+
     /// Reuse this connection for several queries in one callback.
     pub async fn with_connection<F, T>(&self, f: F) -> Result<T>
     where
@@ -627,6 +672,14 @@ where
         F: for<'tx> AsyncFnOnce(DslContext<&'tx Transaction<'tx>>) -> Result<T>,
     {
         transaction_with_transaction(self.executor, f).await
+    }
+
+    /// Begin a nested savepoint without a closure.
+    ///
+    /// See [`DslContext::<&mut Client>::begin`] for the rationale.
+    pub async fn begin(&mut self) -> Result<DslTransaction<'_>> {
+        let txn = self.executor.transaction().await.map_err(map_pg_error)?;
+        Ok(DslTransaction::new(txn))
     }
 }
 
@@ -652,6 +705,106 @@ impl DslContext<Pool> {
         let conn = self.executor.acquire().await?;
         f(DslContext::new(conn.as_client())).await
     }
+
+    /// Acquire one physical connection from the pool without a closure.
+    ///
+    /// Returns a [`DslConnection`] that owns the deadpool object. Use
+    /// [`DslConnection::dsl`] / [`DslConnection::dsl_mut`] to issue queries
+    /// against that connection, and [`DslConnection::begin`] to start a
+    /// transaction. The connection is returned to the pool when dropped.
+    ///
+    /// Two-step (`acquire` + `begin`) instead of a one-shot `begin()` because
+    /// the transaction borrows from the pooled connection ~ holding both on
+    /// the caller's stack avoids self-referential lifetimes.
+    pub async fn acquire(&self) -> Result<DslConnection> {
+        let conn = self.executor.acquire().await?;
+        Ok(DslConnection { conn })
+    }
+}
+
+/// Owned, pool-acquired connection that can issue queries or begin a
+/// transaction. Returns to the pool on drop.
+pub struct DslConnection {
+    conn: deadpool_postgres::Client,
+}
+
+impl DslConnection {
+    /// Read-only DSL bound to this connection.
+    pub fn dsl(&self) -> DslContext<&Client> {
+        DslContext::new(self.conn.as_client())
+    }
+
+    /// Mutable DSL bound to this connection (required for nested transactions).
+    pub fn dsl_mut(&mut self) -> DslContext<&mut Client> {
+        DslContext::new(self.conn.as_client_mut())
+    }
+
+    /// Begin a transaction on this connection.
+    ///
+    /// Returns a [`DslTransaction`] guard. Drop = rollback (via tokio-postgres'
+    /// own `Transaction::drop`); call [`DslTransaction::commit`] to persist.
+    pub async fn begin(&mut self) -> Result<DslTransaction<'_>> {
+        let txn = self
+            .conn
+            .as_client_mut()
+            .transaction()
+            .await
+            .map_err(map_pg_error)?;
+        Ok(DslTransaction::new(txn))
+    }
+}
+
+/// Transaction guard for the non-closure transaction API
+/// ([`DslContext::<&mut Client>::begin`], [`DslConnection::begin`]).
+///
+/// Holds an active `tokio_postgres::Transaction`. Use [`Self::dsl`] to issue
+/// queries inside the transaction. Finalize with [`Self::commit`] or
+/// [`Self::rollback`]; dropping without committing rolls back automatically
+/// (via the inner `Transaction`'s own drop behavior).
+pub struct DslTransaction<'a> {
+    txn: Option<Transaction<'a>>,
+}
+
+impl<'a> DslTransaction<'a> {
+    fn new(txn: Transaction<'a>) -> Self {
+        Self { txn: Some(txn) }
+    }
+
+    /// Read-only DSL bound to this transaction.
+    pub fn dsl(&self) -> DslContext<&Transaction<'a>> {
+        DslContext::new(
+            self.txn
+                .as_ref()
+                .expect("DslTransaction was already finalized"),
+        )
+    }
+
+    /// Mutable DSL bound to this transaction (required to start a nested savepoint).
+    pub fn dsl_mut(&mut self) -> DslContext<&mut Transaction<'a>> {
+        DslContext::new(
+            self.txn
+                .as_mut()
+                .expect("DslTransaction was already finalized"),
+        )
+    }
+
+    /// Commit the transaction.
+    pub async fn commit(mut self) -> Result<()> {
+        let txn = self
+            .txn
+            .take()
+            .expect("DslTransaction was already finalized");
+        txn.commit().await.map_err(map_pg_error)
+    }
+
+    /// Roll back the transaction.
+    pub async fn rollback(mut self) -> Result<()> {
+        let txn = self
+            .txn
+            .take()
+            .expect("DslTransaction was already finalized");
+        txn.rollback().await.map_err(map_pg_error)
+    }
 }
 
 impl<M> DslContext<bb8::Pool<M>>
@@ -673,6 +826,20 @@ where
 /// Decode a `tokio-postgres` row into a Rust value.
 pub trait FromRow: Sized {
     fn from_row(row: &PgRow) -> Result<Self>;
+}
+
+/// Decode a single column from a row, wrapping any decode failure into a
+/// `Error::row_decode` with the column name included.
+///
+/// Same shape the `#[derive(FromRow)]` macro uses internally. Useful when
+/// writing `#[fuwa(decode_with = "...")]` helpers ~ collapses the
+/// `try_get` + `map_err` + `format!` boilerplate to a single `?`.
+pub fn decode_field<T>(row: &PgRow, column: &str) -> Result<T>
+where
+    T: FromSqlOwned,
+{
+    row.try_get(column)
+        .map_err(|err| Error::row_decode(format!("failed to decode column {column}: {err}")))
 }
 
 fn ensure_width(row: &PgRow, expected: usize) -> Result<()> {

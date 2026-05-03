@@ -804,6 +804,8 @@ async fn handler(State(state): State<AppState>) -> fuwa::Result<String> {
 
 ## postgres transactions
 
+### closure form
+
 `DslContext::transaction(...)` opens a postgres transaction, passes a
 transaction-scoped DSL context to the callback, commits on success, and rolls
 back when the callback returns an error:
@@ -826,6 +828,64 @@ async fn transaction_example(dsl: DslContext<Pool>) -> fuwa::Result<()> {
     .await
 }
 ```
+
+### non-closure form: `acquire` + `begin` + `commit`
+
+the closure form bounds the callback on `for<'tx> AsyncFnOnce(...)`. that
+HRTB can hit Rust's async-closure inference limits in some calling contexts
+(notably inside `async_trait` methods, or when the closure body captures
+non-`'static` references from `&self`). when that happens, the symptom is
+
+```
+error: implementation of `AsyncFnOnce` is not general enough
+```
+
+the non-closure API gives the same transactional semantics without the HRTB:
+
+```rust
+use fuwa::prelude::*;
+
+async fn explicit_tx(dsl: &DslContext<Pool>, user_id: &str) -> fuwa::Result<()> {
+    let mut conn = dsl.acquire().await?;
+    let tx = conn.begin().await?;
+
+    let row = tx
+        .dsl()
+        .select(swipe_recent_buffer::recent_images)
+        .from(swipe_recent_buffer::table)
+        .where_(swipe_recent_buffer::user_id.eq(user_id))
+        .for_update()
+        .fetch_optional_as::<Vec<String>>()
+        .await?;
+
+    tx.dsl()
+        .raw(r#"insert into "SwipeRecentBuffer" ("userId", "recentImages") values ($1, $2)"#)
+        .bind(user_id)
+        .bind(row.unwrap_or_default())
+        .execute()
+        .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+```
+
+call shape:
+
+- `dsl.acquire().await?` → `DslConnection` (owns one pooled connection; returned
+  on drop).
+- `conn.begin().await?` → `DslTransaction<'_>` (borrows from `conn`).
+- `tx.dsl()` / `tx.dsl_mut()` → `DslContext<&Transaction<'_>>` for issuing
+  queries; mutable form lets you start a nested savepoint via `.begin()`.
+- `tx.commit().await?` / `tx.rollback().await?` → finalize. dropping the guard
+  without committing rolls back via tokio-postgres' own `Transaction::drop`.
+
+the two-step `acquire` + `begin` is needed because the transaction borrows
+from the pooled connection ~ holding both on the caller's stack avoids
+self-referential lifetimes.
+
+for `DslContext<&mut Client>` (or `DslContext<&mut Transaction<'_>>`),
+`.begin()` is available directly (no separate `acquire`).
 
 ## postgres streaming
 
@@ -864,6 +924,78 @@ async fn stream_example(dsl: DslContext<Pool>) -> fuwa::Result<()> {
     Ok(())
 }
 ```
+
+## decoding rows ~ `#[derive(FromRow)]`
+
+every projection decodes into a `FromRow` impl. codegen emits one for each
+table's `Record` struct, but for raw queries / hand-rolled row shapes /
+projections that diverge from the table layout, the derive macro covers it:
+
+```rust
+#[derive(fuwa::FromRow)]
+struct UserRow {
+    id: i64,
+    email: String,
+}
+
+let row = dsl.raw("select id, email from users where id = $1")
+    .bind(7_i64)
+    .fetch_one_as::<UserRow>()
+    .await?;
+```
+
+decode is by **column name**, not position ~ aliasing in the SQL changes the
+target column.
+
+### field attributes
+
+| attr | use |
+|---|---|
+| `#[fuwa(rename = "sqlName")]` | column name override (default = the field's Rust name) |
+| `#[fuwa(rename_all = "...")]` (container) | apply a casing rule across all fields. supports `lowercase`, `UPPERCASE`, `snake_case`, `SCREAMING_SNAKE_CASE`, `camelCase`, `PascalCase`, `kebab-case` |
+| `#[fuwa(skip)]` | dont decode; field gets `Default::default()` |
+| `#[fuwa(default)]` | decode if the column is present in the row, else `Default::default()` (handy for projections that sometimes omit a column) |
+| `#[fuwa(flatten)]` | decode a nested struct from the same row, by name (the inner struct's columns must be present alongside) |
+| `#[fuwa(decode_with = "fn_path")]` | custom decoder. `fn_path` must have signature `fn(&fuwa::Row, &str) -> fuwa::Result<FieldTy>` |
+
+### `decode_with` for type-converting fields
+
+the base derive emits `row.try_get::<_, FieldTy>(column_name)` ~ no
+`Into`/`From` hook between the column type and the field type. when those
+diverge (postgres `double precision` → rust `f32`, `timestamp` →
+`Option<DateTime<Utc>>`, jsonb → a custom enum, etc.), `decode_with` is the
+escape hatch:
+
+```rust
+#[derive(fuwa::FromRow)]
+struct ScoredItem {
+    id: i64,
+    #[fuwa(decode_with = "decode_score_f32")]
+    score: f32,
+}
+
+fn decode_score_f32(row: &fuwa::Row, column: &str) -> fuwa::Result<f32> {
+    let v: f64 = fuwa::decode_field(row, column)?;
+    Ok(v as f32)
+}
+```
+
+`fuwa::decode_field::<T>(row, column)` is the same `try_get` + error-wrap the
+derive uses internally ~ wraps any decode failure into an `Error::row_decode`
+with the column name included.
+
+`Insertable` and `Patch` follow the same field-attribute spelling for
+`rename` / `rename_all`. they emit one `column.set(self.field)` per field
+(skipping `None` for `Patch`'s `Option<T>` fields).
+
+## escape hatch: `dsl.executor()`
+
+`DslContext::executor(&self) -> &E` borrows the underlying executor. useful
+when you need to reach the source `Pool`, `Client`, or `Transaction` directly
+~ e.g. to call `pool.status()`, run a deadpool-specific operation, or use
+`tokio_postgres` APIs that fuwa doesnt wrap. the executor types and
+`deadpool_postgres` itself are re-exported from `fuwa::postgres` so you dont
+need to add them as direct deps.
 
 ## raw SQL escape hatch
 
@@ -958,6 +1090,9 @@ dsl.select(users::id)
 
 `.filter(...)` is also accepted as a diesel-style alias for `.where_(...)`.
 
+comparison ops on `Field<T, _>` and `Expr<T, _>`: `eq`, `ne`, `lt`, `le`,
+`gt`, `ge`. names match `std::cmp::PartialOrd`.
+
 for accumulating filters one-at-a-time across a function body, `and_where` /
 `and_having` and the `push_*` helpers keep the query type stable through a
 mutation loop:
@@ -982,6 +1117,45 @@ the bare AST nodes (`SelectItem`, `OrderExpr`, `Join`, `ExprNode`) when you
 need to vary the projection / sort / joins by request input. they don't change
 the query's record type, so dynamic columns need an explicit `fetch_all_as::<T>()`
 to choose how rows decode.
+
+### dont reach for `String::push_str` + `dsl.raw(...)`
+
+a common anti-pattern when adapting an existing `format!`-based query layer:
+
+```rust
+// dont do this ~ no compile-time column / type checks, manual $N bookkeeping,
+// extra entries in the prepared-statement cache for every shape variant.
+let mut sql = String::from(r#"select * from "SwipeHistory" where "userId" = $1"#);
+if cutoff.is_some()    { sql.push_str(r#" and "createdAt" >= $2"#); }
+if max_swipes.is_some() {
+    let n = if cutoff.is_some() { 3 } else { 2 };
+    sql.push_str(&format!(" limit ${n}"));
+}
+let mut q = dsl.raw(sql).bind(user_id);
+if let Some(c) = cutoff     { q = q.bind(c); }
+if let Some(n) = max_swipes { q = q.bind(n); }
+let rows = q.fetch_all_as::<SwipeHistoryRow>().await?;
+```
+
+the typed-DSL accumulation pattern is the same shape with full compile-time
+checking and one stable prepared-statement cache entry per shape:
+
+```rust
+let mut q = dsl
+    .select(swipe_history::all())
+    .from(swipe_history::table)
+    .where_(swipe_history::user_id.eq(user_id));
+if let Some(c) = cutoff     { q = q.and_where(swipe_history::created_at.ge(c)); }
+let mut q = q.order_by(swipe_history::created_at.desc());
+if let Some(n) = max_swipes { q = q.limit(n); }
+let rows = q.fetch_all_as::<SwipeHistoryRow>().await?;
+```
+
+if the SQL really cant be expressed in the DSL (e.g. complex CTE, recursive
+query, postgres-specific syntax not yet wrapped) but you still want column /
+table sanity-checking, use the [`fuwa::query!`](#compile-time-checked-raw-sql)
+macro on the static template ~ then `dsl.raw(sql).bind(...).bind(...)` against
+the macro's output. raw `String::push_str` should only be a last resort.
 
 ### inspecting rendered SQL
 
